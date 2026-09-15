@@ -1,7 +1,13 @@
 name: BoringCache validation — fixpp ccache retention
+run-name: BoringCache validation — fixpp ${{ inputs.source_ref }}
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact upstream commit to build
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,8 +38,18 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+      - name: Checkout the validation plan
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
         with:
+          ref: boringcache-validation
+          path: .boringcache-plan
+          persist-credentials: false
+
+      - name: Checkout the upstream source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: source
           persist-credentials: false
 
       - name: Free disk space for the debug build
@@ -48,6 +64,7 @@ jobs:
           swap-storage: false
 
       - name: Install Clang 22, GCC 13, and Ninja
+        working-directory: source
         run: |
           wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
@@ -85,6 +102,7 @@ jobs:
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: Restore fixpp's existing Conan cache
+        working-directory: source
         run: ci/restore-conan-cache.sh linux-clang-debug
 
       - name: Install ccache and its HTTP storage helper
@@ -112,12 +130,14 @@ jobs:
       - name: Configure BoringCache ccache publishing
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
+          working-directory: .boringcache-plan
           trust-policy: publish
           mode: ccache
           diagnostics: summary
           fail-on-cache-error: true
 
       - name: Resolve Conan dependencies
+        working-directory: source
         run: |
           conan export conan/recipes/civetweb --version 1.16
           conan install . \
@@ -126,22 +146,26 @@ jobs:
             -of build/linux-clang-debug
 
       - name: Check the dependency build configuration
+        working-directory: source
         run: ci/assert-sanitized-deps.sh linux-clang-debug build/linux-clang-debug
 
       - name: Resolve fixpp's Python build configuration
         id: python_build
+        working-directory: source
         run: ci/derive-python-sanitizer.sh linux-clang-debug >> "$GITHUB_OUTPUT"
 
       - name: Configure fixpp
+        working-directory: source
         run: >-
           cmake --preset linux-clang-debug
-          -DFIXPP_ARTIFACT_DIR=${{ github.workspace }}/_artifacts
+          -DFIXPP_ARTIFACT_DIR=${{ github.workspace }}/source/_artifacts
           -DFIXPP_BUILD_PYTHON=ON
           -DFIXPP_INSTALL_PYTHON=${{ steps.python_build.outputs.install_python }}
           -DFIXPP_PY_INSTALL_LAYOUT=${{ steps.python_build.outputs.py_layout }}
           -DFIXPP_PYTHON_SANITIZER=${{ steps.python_build.outputs.sanitizer }}
 
       - name: Build fixpp
+        working-directory: source
         run: cmake --build --preset linux-clang-debug
 
   restore:
@@ -154,8 +178,18 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+      - name: Checkout the validation plan
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
         with:
+          ref: boringcache-validation
+          path: .boringcache-plan
+          persist-credentials: false
+
+      - name: Checkout the upstream source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: source
           persist-credentials: false
 
       - name: Free disk space for the debug build
@@ -170,6 +204,7 @@ jobs:
           swap-storage: false
 
       - name: Install Clang 22, GCC 13, and Ninja
+        working-directory: source
         run: |
           wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
@@ -207,6 +242,7 @@ jobs:
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: Restore fixpp's existing Conan cache
+        working-directory: source
         run: ci/restore-conan-cache.sh linux-clang-debug
 
       - name: Install ccache and its HTTP storage helper
@@ -234,12 +270,14 @@ jobs:
       - name: Configure read-only BoringCache ccache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
+          working-directory: .boringcache-plan
           trust-policy: restore
           mode: ccache
           diagnostics: summary
           fail-on-cache-error: true
 
       - name: Resolve Conan dependencies
+        working-directory: source
         run: |
           conan export conan/recipes/civetweb --version 1.16
           conan install . \
@@ -248,20 +286,24 @@ jobs:
             -of build/linux-clang-debug
 
       - name: Check the dependency build configuration
+        working-directory: source
         run: ci/assert-sanitized-deps.sh linux-clang-debug build/linux-clang-debug
 
       - name: Resolve fixpp's Python build configuration
         id: python_build
+        working-directory: source
         run: ci/derive-python-sanitizer.sh linux-clang-debug >> "$GITHUB_OUTPUT"
 
       - name: Configure fixpp
+        working-directory: source
         run: >-
           cmake --preset linux-clang-debug
-          -DFIXPP_ARTIFACT_DIR=${{ github.workspace }}/_artifacts
+          -DFIXPP_ARTIFACT_DIR=${{ github.workspace }}/source/_artifacts
           -DFIXPP_BUILD_PYTHON=ON
           -DFIXPP_INSTALL_PYTHON=${{ steps.python_build.outputs.install_python }}
           -DFIXPP_PY_INSTALL_LAYOUT=${{ steps.python_build.outputs.py_layout }}
           -DFIXPP_PYTHON_SANITIZER=${{ steps.python_build.outputs.sanitizer }}
 
       - name: Build fixpp
+        working-directory: source
         run: cmake --build --preset linux-clang-debug
