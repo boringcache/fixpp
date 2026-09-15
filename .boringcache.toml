@@ -4,6 +4,6 @@ workspace = "boringcache/fixpp"
 metadata-hints = ["project=fixpp", "experiment=issue-411-tier1"]
 
 [adapters.ccache]
-tag = "fixpp-tier1-ccache"
+tag = "fixpp-tier1-ccache-rolling-20260915"
 no-git = true
 metadata-hints = ["tool=ccache", "workflow=tier1"]

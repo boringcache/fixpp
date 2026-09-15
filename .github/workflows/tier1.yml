@@ -1,4 +1,5 @@
 name: Tier 1 — Linux CI
+run-name: Tier 1 — Linux CI${{ inputs.source_ref && format(' — {0}', inputs.source_ref) || '' }}
 
 on:
   push:
@@ -46,6 +47,11 @@ on:
     types: [opened, reopened, synchronize, labeled, unlabeled, edited]
     branches: ["**"]
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact upstream commit to build for rolling validation
+        required: true
+        type: string
   # 056 REL-1: on a published GitHub release, the python-wheel-release job below
   # attaches the single cp312-abi3 wheel as a release asset (no PyPI — REL-2).
   # The wheel build + full install-test matrix run first on the release commit so
@@ -119,6 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.source_ref || github.sha }}
           fetch-depth: 0
 
       - name: Decide whether the gates permit Tier 1
@@ -412,6 +419,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       # The Debug+sanitizer legs (asan/ubsan/tsan) are the disk-heaviest: 3627
       # ninja edges (1460 compiles + 1460 C++20 module scans + 330 links), and a
@@ -582,9 +591,19 @@ jobs:
             "${RUNNER_TEMP}/ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64/ccache-storage-http" \
             /usr/local/bin/ccache-storage-http
 
+      - name: Checkout the BoringCache validation plan
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          ref: boringcache-validation
+          path: .boringcache-plan
+          sparse-checkout: .boringcache.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Use BoringCache for the shared Tier 1 compiler cache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
+          working-directory: .boringcache-plan
           trust-policy: auto
           mode: ccache
           diagnostics: summary
@@ -1293,6 +1312,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       # Heavy build on the ~14 GB free-disk ceiling; reclaim the preinstalled
       # SDKs we don't use (~30 GB). Mirrors the `linux` job's identical step.
@@ -1399,9 +1420,19 @@ jobs:
             "${RUNNER_TEMP}/ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64/ccache-storage-http" \
             /usr/local/bin/ccache-storage-http
 
+      - name: Checkout the BoringCache validation plan
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          ref: boringcache-validation
+          path: .boringcache-plan
+          sparse-checkout: .boringcache.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Use BoringCache for the shared Tier 1 compiler cache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
+          working-directory: .boringcache-plan
           trust-policy: auto
           mode: ccache
           diagnostics: summary
@@ -1674,6 +1705,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       # cibuildwheel builds the whole engine + static OpenSSL in-container onto the
       # host disk; reclaim the preinstalled SDKs we don't use (~30 GB) for margin.
@@ -1993,6 +2026,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - uses: actions/setup-python@v6
         with:
@@ -2105,6 +2140,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Regression pin — conan-cache restore dispositions (#245)
         run: bash ci/test-restore-conan-cache.sh
@@ -2535,6 +2572,8 @@ jobs:
       PRESET: linux-clang-release
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Install Clang 22 (apt.llvm.org) + Ninja
         run: |
@@ -2698,6 +2737,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - uses: actions/setup-python@v6
         with:
@@ -2762,6 +2803,7 @@ jobs:
       # HEAD, so `git rev-parse HEAD~1` and a checkout of base.sha both fail.
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.source_ref || github.sha }}
           fetch-depth: 0
 
       # Heavy build on the ~14 GB free-disk ceiling; reclaim the preinstalled
@@ -2900,9 +2942,19 @@ jobs:
             "${RUNNER_TEMP}/ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64/ccache-storage-http" \
             /usr/local/bin/ccache-storage-http
 
+      - name: Checkout the BoringCache validation plan
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          ref: boringcache-validation
+          path: .boringcache-plan
+          sparse-checkout: .boringcache.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Restore the shared Tier 1 compiler cache through BoringCache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
+          working-directory: .boringcache-plan
           trust-policy: restore
           mode: ccache
           diagnostics: summary
