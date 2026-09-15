@@ -323,6 +323,7 @@ jobs:
     permissions:
       contents: read
       packages: write  # auto-push-on-miss (push:main / dispatch on main) — save rebuilt Conan cache to GHCR
+      id-token: write  # BoringCache authenticates this trusted validation run through GitHub OIDC
     # Backstop against a hung test wedging the runner. A clean sanitizer leg is
     # ~24 min (build ~15 + test ~6 + setup); the debug leg hit ~45 min cold (whole
     # tree recompile on a new branch). 60->90 (2026-07-09): the tsan leg hit the
@@ -391,13 +392,8 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CCACHE_COMPILERCHECK: content
-      # CCACHE_COMPRESSLEVEL: raise zstd compression from the default (~1) to 5.
-      # The repo shares ONE Actions-cache quota (10 GB default) across every
-      # preset's ccache — so smaller stored blobs both fit more logical objects
-      # under each preset's max-size (the 2G store logged 99.93%-full / 56
-      # cleanups) AND cut cross-preset LRU eviction. CPU cost is negligible next
-      # to the C++ compile. (078 follow-up — measure hit-rate before touching
-      # max-size.)
+      # Keep the upstream compression level so stored-byte and transfer
+      # measurements remain comparable with the issue's existing evidence.
       CCACHE_COMPRESSLEVEL: "5"
       # Keep ccache outside the checkout so source-cleanliness tests do not see
       # the action's default .ccache directory as an untracked repo file.
@@ -554,63 +550,46 @@ jobs:
       # found) and the whole lane goes red. The earlier assumption that Tier 1
       # (libstdc++) always resolves to prebuilt deps was NOT durable: abseil/
       # 20260107.1 shipped with no linux-gcc-release binary and forced a
-      # from-source build that hit exit 127. Installing ccache here (this action
-      # installs ccache + restores the cross-run cache) BEFORE the from-source
-      # dependency builds fixes it and additionally lets those builds hit the
-      # cache. Same fix landed on Tier 3 in #177 — ref
+      # from-source build that hit exit 127. Installing ccache and its storage
+      # helper before starting the BoringCache proxy keeps those dependency
+      # builds on the same compiler-cache path. Same fix landed on Tier 3 in
+      # #177 — ref
       # project_tier3_libcxx_crc32c_ccache127_infra.
-      - name: ccache (install + restore + save compiler cache)
-        uses: hendrikmuhs/ccache-action@v1.2.23
+      - name: Install ccache and its HTTP storage helper
+        env:
+          CCACHE_VERSION: "4.14"
+          CCACHE_SHA256: c64760b0b85ba86068f4cd162dc42e2dc39c6f46b0cb8c1990dfccbec7a1fed0
+          CCACHE_STORAGE_HTTP_VERSION: "0.9"
+          CCACHE_STORAGE_HTTP_SHA256: 875dbf6d575d06e4c4492f1ba639beb68530bc23382031a6bacc767cded9f463
+        run: |
+          ccache_archive="ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.gz"
+          curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/${ccache_archive}" \
+            --output "${RUNNER_TEMP}/${ccache_archive}"
+          echo "${CCACHE_SHA256}  ${RUNNER_TEMP}/${ccache_archive}" | sha256sum --check
+          tar xzf "${RUNNER_TEMP}/${ccache_archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 \
+            "${RUNNER_TEMP}/ccache-${CCACHE_VERSION}-linux-x86_64-glibc/ccache" \
+            /usr/local/bin/ccache
+
+          helper_archive="ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64.tar.gz"
+          curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://github.com/ccache/ccache-storage-http-go/releases/download/v${CCACHE_STORAGE_HTTP_VERSION}/${helper_archive}" \
+            --output "${RUNNER_TEMP}/${helper_archive}"
+          echo "${CCACHE_STORAGE_HTTP_SHA256}  ${RUNNER_TEMP}/${helper_archive}" | sha256sum --check
+          tar xzf "${RUNNER_TEMP}/${helper_archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 \
+            "${RUNNER_TEMP}/ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64/ccache-storage-http" \
+            /usr/local/bin/ccache-storage-http
+
+      - name: Use BoringCache for the shared Tier 1 compiler cache
+        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
-          key: tier1-${{ matrix.preset }}
-          # 500M was too small for the debug + sanitizer legs: their object cache
-          # exceeded it, so ccache thrashed (cache 99.93% full, 56 cleanups, only
-          # ~10% hit rate) and even warm runs recompiled ~everything, pushing the
-          # debug build to the full 45-min timeout. 2G holds a leg's full object
-          # set so warm runs actually hit.
-          max-size: 2G
-          # RESTORE-ONLY ON PULL REQUESTS (2026-08-02) — a PR must never WRITE to
-          # the repo-wide 10 GB Actions-cache pool.
-          #
-          # GitHub scopes cache READS to the run's own ref plus the default
-          # branch, so a PR's own saved entries become PERMANENTLY UNREACHABLE
-          # the moment it merges — no later `main` run and no sibling PR can read
-          # them — while still counting against the cap until evicted. Measured
-          # right after 083/#216 merged: `refs/heads/main` held 1 cache / 234 MB
-          # (zero ccache) against `refs/pull/216/merge` at 15 caches / 9,749 MB —
-          # 97.6% of the budget owned by a closed PR, which had LRU-evicted
-          # main's ccache even though the prior push:main run's save step had
-          # succeeded. That is what made 083 pay a cold ~1500-object rebuild.
-          #
-          # The arithmetic, not just the tidiness: one clean `main` set WAS
-          # ~7.6 GiB (4 sanitizer legs at 1.4-1.9 GB + 4 tier3 legs at ~460 MB +
-          # Conan/ABI entries) of a 10 GB cap. MEASURED 2026-08-08 from
-          # actions/cache/usage: 8.49 GiB live over 15 caches, 7.61 GiB after
-          # this workflow's keep-newest sweep converges. #240 then moved the four
-          # tier3 legs (1.80 GiB) to GHCR, which brings this to **5.82 GiB** and
-          # ~4.2 GiB of headroom — the room #241's coverage cache is budgeted
-          # against. Do not re-quote the ~7.7 GB figure as current.
-          #
-          # ⚠️ 5.82 GiB IS CONDITIONAL ON A MANUAL STEP, so verify it before
-          # budgeting against it. cache-cleanup.yml's keep-newest sweep only
-          # deletes what something SUPERSEDED, so the four retired
-          # `ccache-tier3-*` entries are protected forever and the 1.80 GiB is
-          # NOT reclaimed by moving the lane — a one-time `gh cache delete` is.
-          # Until that has run, this number is a projection, not a reading:
-          # `gh api repos/<owner>/<repo>/actions/cache/usage`. The trap is
-          # recorded at the sweep itself in cache-cleanup.yml. An open PR running the same matrix would add
-          # ~7 GB — so deleting a PR's caches when it CLOSES cannot prevent the
-          # eviction, which happens while the PR is still open. Only not writing
-          # does. Bounding PR saves instead was rejected: ~2 GB spread over 11
-          # legs is ~180 MB each, i.e. the thrash config the 2G above escaped.
-          #
-          # PR runs still RESTORE — the base-branch fallback gives them main's
-          # warm cache — so a PR pays only the delta against `main`, never a cold
-          # build. What it loses is incrementality BETWEEN pushes on the same PR
-          # (each Gate-B fixer round re-restores from main rather than from the
-          # previous push). See remaining-work/ci-ghcr-package-offload-plan.md
-          # "MEASURED 2026-08-02" and feedback_pr_scoped_actions_caches_unreachable_but_evict_main.
-          save: ${{ github.event_name == 'push' }}
+          trust-policy: auto
+          mode: ccache
+          diagnostics: summary
+          fail-on-cache-error: true
+          save-always: true
 
       - name: Conan install
         run: |
@@ -1272,6 +1251,7 @@ jobs:
     permissions:
       contents: read
       packages: write  # auto-push-on-miss (push:main / dispatch on main) — coverage owns its tag
+      id-token: write  # BoringCache authenticates this trusted validation run through GitHub OIDC
     # Backstop against a hung coverage build; matches the `linux` job's 90 for
     # cold-ccache headroom (previously inherited GitHub's 360-min default).
     # 180->240 (2026-08-02, 083): tracks the `linux` job for the same reason —
@@ -1293,14 +1273,10 @@ jobs:
     # see that block for the rationale behind each variable. Two coverage-specific
     # notes:
     #
-    #  * CCACHE_DIR is NOT shared with the matrix debug leg even though both are
-    #    CMAKE_BUILD_TYPE=Debug. conan/profiles/linux-clang-coverage folds
-    #    -fprofile-instr-generate/-fcoverage-mapping into `tools.build:cxxflags`
-    #    AND into `tools.info.package_id:confs`, so its whole dependency closure
-    #    resolves to different ~/.conan2/p/<hash> paths. Different -isystem =>
-    #    different ccache hash on every TU that touches a dependency header. A
-    #    shared directory would not corrupt anything (ccache keys on the full
-    #    command line) but it would double the store for zero hits.
+    #  * CCACHE_DIR remains separate from the matrix debug leg for local ccache
+    #    state and statistics. BoringCache sets remote-only storage and uses one
+    #    shared remote namespace; ccache's command hash keeps coverage objects
+    #    distinct because the coverage flags and dependency paths differ.
     #
     #  * hash_dir is left at its default. The preset is Debug, so -g is present,
     #    so ccache hashes the CWD — which is what keeps the absolute
@@ -1393,27 +1369,44 @@ jobs:
       # from-source builds too, and `conan install --build=missing` below takes
       # that path whenever the GHCR restore misses. With ccache not yet on PATH
       # the dependency's compiler probe dies with exit 127 — the identical trap
-      # recorded at the matrix job's step and on Tier 3 (#177). This action both
-      # INSTALLS ccache and restores the cross-run cache, so ordering it here
-      # discharges both needs at once.
-      #
-      # Same restore-only-on-PR posture and the same 2G cap as the matrix legs —
-      # see that step's comment for the pool arithmetic. This lane's entry
-      # measured 901 MiB cold / 925 MiB warm. For the pool arithmetic see §9 of
-      # .specify/ci241-coverage-ccache.md — measured 2026-08-12: 6.49 GB over 9
-      # entries, projected 7.46 GB (74.6%) with this lane, 2.54 GB headroom
-      # against a 10 GB decimal cap.
-      # ⚠️ Re-derive by RE-LISTING (`gh cache list`); `gh api
-      # repos/<owner>/<repo>/actions/cache/usage` lags deletes and must not be
-      # trusted alone (cache-cleanup.yml's "Sweep unreachable PR cache scopes" step).
-      - name: ccache (install + restore + save compiler cache)
-        uses: hendrikmuhs/ccache-action@v1.2.23
+      # recorded at the matrix job's step and on Tier 3 (#177). BoringCache does
+      # not install these prerequisites, so the workflow installs the pinned
+      # upstream binaries before it starts the native ccache adapter.
+      - name: Install ccache and its HTTP storage helper
+        env:
+          CCACHE_VERSION: "4.14"
+          CCACHE_SHA256: c64760b0b85ba86068f4cd162dc42e2dc39c6f46b0cb8c1990dfccbec7a1fed0
+          CCACHE_STORAGE_HTTP_VERSION: "0.9"
+          CCACHE_STORAGE_HTTP_SHA256: 875dbf6d575d06e4c4492f1ba639beb68530bc23382031a6bacc767cded9f463
+        run: |
+          ccache_archive="ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.gz"
+          curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/${ccache_archive}" \
+            --output "${RUNNER_TEMP}/${ccache_archive}"
+          echo "${CCACHE_SHA256}  ${RUNNER_TEMP}/${ccache_archive}" | sha256sum --check
+          tar xzf "${RUNNER_TEMP}/${ccache_archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 \
+            "${RUNNER_TEMP}/ccache-${CCACHE_VERSION}-linux-x86_64-glibc/ccache" \
+            /usr/local/bin/ccache
+
+          helper_archive="ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64.tar.gz"
+          curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://github.com/ccache/ccache-storage-http-go/releases/download/v${CCACHE_STORAGE_HTTP_VERSION}/${helper_archive}" \
+            --output "${RUNNER_TEMP}/${helper_archive}"
+          echo "${CCACHE_STORAGE_HTTP_SHA256}  ${RUNNER_TEMP}/${helper_archive}" | sha256sum --check
+          tar xzf "${RUNNER_TEMP}/${helper_archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 \
+            "${RUNNER_TEMP}/ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64/ccache-storage-http" \
+            /usr/local/bin/ccache-storage-http
+
+      - name: Use BoringCache for the shared Tier 1 compiler cache
+        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
-          key: tier1-linux-clang-coverage
-          max-size: 2G
-          # Restore-only on a PR; only `push` (i.e. main) writes the entry —
-          # character-identical to the `linux` and `bench` legs' predicate.
-          save: ${{ github.event_name == 'push' }}
+          trust-policy: auto
+          mode: ccache
+          diagnostics: summary
+          fail-on-cache-error: true
+          save-always: true
 
       # Conan from pre-seeded GHCR (off the 10 GB pool) — see the matrix-job note.
       - name: Set up oras
@@ -1474,30 +1467,10 @@ jobs:
       # the necessarily-cold PR run and first post-merge `main` run (§8 of the
       # record) are not red by design.
       #
-      # ⚠️ Argument 2 is deliberately EMPTY. It is the restore disposition from
-      # ci/restore-ccache.sh's `hit` output, and this lane restores via
-      # `ccache-action`, which exposes no equivalent output. The script renders
-      # an absent disposition as `n/a` and skips the restored-but-cold warning
-      # that depends on it — passing a guessed 'true'/'false' here would
-      # manufacture a disposition nothing measured.
-      #
-      # ⚠️ AND THAT IS WHY THIS LANE GETS NO HIT FLOOR, while the wheel and
-      # tier-3 lanes took one in #299. THE OMISSION IS THE POINT, not an
-      # oversight to be tidied up later by adding the argument.
-      #
-      # The floor in ci/ccache-stats.sh is gated on `RESTORE == 'true'`, and
-      # that gate is what makes it safe — it is how a legitimate cold/seeding
-      # run stays green. This lane can never supply that disposition, so a
-      # floor passed here would print "hit-floor N% NOT evaluated" on every run
-      # forever: a gate that runs, exits 0 and measures nothing, which is the
-      # precise defect #299 was filed about. Adding the argument would satisfy
-      # the issue's wording while REPRODUCING its subject.
-      #
-      # ⛔ DO NOT "FIX" THIS BY PASSING A FLOOR. The prerequisite is a real
-      # restore disposition for this lane, which means migrating it off
-      # `ccache-action` onto ci/restore-ccache.sh the way #240 did for tier 3 —
-      # a cache-storage change, not a one-argument edit. Until then a floor here
-      # is unenforceable, and the honest state is to say so.
+      # Argument 2 remains empty because this project-specific reporter expects
+      # the output contract of Fixpp's archive restore script. BoringCache's
+      # action summary separately reports the preflight disposition and native
+      # ccache counters for this run.
       - name: ccache statistics
         run: ci/ccache-stats.sh linux-clang-coverage '' '${{ steps.build.outcome }}'
 
@@ -2757,6 +2730,10 @@ jobs:
   bench:
     name: bench
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      id-token: write  # BoringCache authenticates this restore-only consumer through GitHub OIDC
     # Backstop against a hung bench build; matches the `linux` job's 90
     # (previously inherited GitHub's 360-min default).
     timeout-minutes: 180
@@ -2773,19 +2750,10 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CCACHE_COMPILERCHECK: content
-      CCACHE_COMPRESSLEVEL: "5"   # see matrix `linux` job — shared 10 GB cache quota
-      # ⚠️ THE PATH IS PART OF THE CACHE IDENTITY — it MUST equal the matrix
-      # `linux-clang-release` leg's `CCACHE_DIR` (/tmp/fixpp-ccache-${{ matrix.preset }}),
-      # not a bench-specific one. actions/cache identifies an entry by
-      # (key, VERSION), where version is a hash of the PATHS being cached. Keying
-      # this job on `tier1-linux-clang-release` while caching a differently-named
-      # directory produced a byte-identical key that still missed: run
-      # 32159716654 logged `Restore cache / No cache found.` here at 16:26:53,
-      # ninety seconds after the matrix leg restored that very entry
-      # (`Cache restored successfully`, ~96 MB) in the SAME run. Result was
-      # 15/1616 hits (0.93%) — identical to the run before the key change, i.e.
-      # the fix was a complete no-op while looking correct in the diff.
-      # Matching the key alone is not enough; match the path too.
+      CCACHE_COMPRESSLEVEL: "5"
+      # Retain the upstream path for local state and comparable statistics.
+      # BoringCache's remote namespace does not derive its identity from this
+      # path; ccache derives object identity from the compiler invocation.
       CCACHE_DIR: /tmp/fixpp-ccache-linux-clang-release
 
     steps:
@@ -2876,8 +2844,8 @@ jobs:
       # ccache MUST install BEFORE "Conan install" so the CMAKE_*_COMPILER_LAUNCHER
       # is on PATH for any conan from-source dependency build (mirrors the `linux`
       # job's ordering + exit-127 note).
-      # ⚠️ THIS JOB IS A PURE CONSUMER OF THE MATRIX `linux-clang-release` LEG'S
-      # ccache — it has NO cache of its own, deliberately (#273).
+      # ⚠️ THIS JOB IS A PURE CONSUMER OF THE SHARED TIER-1 CCACHE NAMESPACE.
+      # It has no writer capability, deliberately (#273).
       #
       # It used to key on `tier1-bench` and save on push:main. MEASURED on PR
       # #279's run 32146773220, where both jobs started at the same second on the
@@ -2899,26 +2867,46 @@ jobs:
       # ProjectOptions.cmake's option decl). It changes no compile flag, so the library/test objects here
       # are hash-identical to the matrix leg's and restore straight into them.
       #
-      # `save: false`, not push-conditional — and that is the load-bearing half.
-      # Saving under a key the matrix leg also writes would let two jobs publish
-      # entries under one prefix, and the matrix leg would then restore whichever
-      # was newest — possibly THIS job's, which lacks whatever the matrix leg
-      # compiles and bench does not. Consuming-only cannot regress the producer.
-      # It also returns a 2 GB slot to the pool that #273 is about.
+      # `trust-policy: restore` is the load-bearing half. The benchmark job can
+      # read objects written by the producer legs but cannot add or delete
+      # entries. It therefore cannot alter the producer namespace.
       #
       # Cost, stated: the bench TARGETS themselves are never cached (a handful of
       # TUs against ~1600). Accepted.
-      - name: ccache (install + restore — CONSUMES the matrix release leg's cache)
-        uses: hendrikmuhs/ccache-action@v1.2.23
+      - name: Install ccache and its HTTP storage helper
+        env:
+          CCACHE_VERSION: "4.14"
+          CCACHE_SHA256: c64760b0b85ba86068f4cd162dc42e2dc39c6f46b0cb8c1990dfccbec7a1fed0
+          CCACHE_STORAGE_HTTP_VERSION: "0.9"
+          CCACHE_STORAGE_HTTP_SHA256: 875dbf6d575d06e4c4492f1ba639beb68530bc23382031a6bacc767cded9f463
+        run: |
+          ccache_archive="ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.gz"
+          curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/${ccache_archive}" \
+            --output "${RUNNER_TEMP}/${ccache_archive}"
+          echo "${CCACHE_SHA256}  ${RUNNER_TEMP}/${ccache_archive}" | sha256sum --check
+          tar xzf "${RUNNER_TEMP}/${ccache_archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 \
+            "${RUNNER_TEMP}/ccache-${CCACHE_VERSION}-linux-x86_64-glibc/ccache" \
+            /usr/local/bin/ccache
+
+          helper_archive="ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64.tar.gz"
+          curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://github.com/ccache/ccache-storage-http-go/releases/download/v${CCACHE_STORAGE_HTTP_VERSION}/${helper_archive}" \
+            --output "${RUNNER_TEMP}/${helper_archive}"
+          echo "${CCACHE_STORAGE_HTTP_SHA256}  ${RUNNER_TEMP}/${helper_archive}" | sha256sum --check
+          tar xzf "${RUNNER_TEMP}/${helper_archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 \
+            "${RUNNER_TEMP}/ccache-storage-http-go-${CCACHE_STORAGE_HTTP_VERSION}-linux-amd64/ccache-storage-http" \
+            /usr/local/bin/ccache-storage-http
+
+      - name: Restore the shared Tier 1 compiler cache through BoringCache
+        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
-          # Same string as the matrix leg's `key: tier1-${{ matrix.preset }}` for
-          # preset `linux-clang-release`. The action prefixes BOTH sides with
-          # `ccache-` and appends `-` under the default append-timestamp, so this
-          # resolves to the prefix `ccache-tier1-linux-clang-release-` and matches
-          # what that leg publishes on push:main.
-          key: tier1-linux-clang-release
-          max-size: 2G
-          save: false
+          trust-policy: restore
+          mode: ccache
+          diagnostics: summary
+          fail-on-cache-error: true
 
       - name: Conan install
         run: |

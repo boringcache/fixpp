@@ -1,9 +1,9 @@
 workspace = "boringcache/fixpp"
 
 [proxy]
-metadata-hints = ["project=fixpp", "experiment=issue-411-five-commit"]
+metadata-hints = ["project=fixpp", "experiment=issue-411-tier1"]
 
 [adapters.ccache]
-tag = "fixpp-tier1-ccache-rolling-five"
-command = ["cmake", "--build", "--preset", "linux-clang-debug"]
-metadata-hints = ["tool=ccache", "lane=linux-clang-debug"]
+tag = "fixpp-tier1-ccache"
+no-git = true
+metadata-hints = ["tool=ccache", "workflow=tier1"]

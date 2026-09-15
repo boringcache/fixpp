@@ -833,7 +833,7 @@ to require a redirection — that was tried, and \`cp <file> \"\$GITHUB_ENV\"\` 
   # Heredoc-assigned because the expected JSON contains single quotes.
   local _expected_uses
   _expected_uses="$(cat <<'FIXPP_USES_EOF'
-[{"uses":"actions/checkout@v6"},{"name":"Free up disk space","uses":"jlumbroso/free-disk-space@main","with":{"android":true,"docker-images":true,"dotnet":true,"haskell":true,"large-packages":false,"swap-storage":false,"tool-cache":true}},{"uses":"actions/setup-python@v6","with":{"python-version":"3.12"}},{"name":"Set up oras","uses":"oras-project/setup-oras@v2"},{"name":"ccache (install + restore + save compiler cache)","uses":"hendrikmuhs/ccache-action@v1.2.23","with":{"key":"tier1-${{ matrix.preset }}","max-size":"2G","save":"${{ github.event_name == 'push' }}"}},{"if":"matrix.preset == 'linux-gcc-release' || matrix.preset == 'linux-clang-release'","name":"Upload packages","uses":"actions/upload-artifact@v7","with":{"if-no-files-found":"error","name":"packages-${{ matrix.preset }}","path":"${{ github.workspace }}/_artifacts/*","retention-days":14}}]
+[{"uses":"actions/checkout@v6"},{"name":"Free up disk space","uses":"jlumbroso/free-disk-space@main","with":{"android":true,"docker-images":true,"dotnet":true,"haskell":true,"large-packages":false,"swap-storage":false,"tool-cache":true}},{"uses":"actions/setup-python@v6","with":{"python-version":"3.12"}},{"name":"Set up oras","uses":"oras-project/setup-oras@v2"},{"name":"Use BoringCache for the shared Tier 1 compiler cache","uses":"boringcache/one@1039999c65011be670f5655e0e48ad556188ab12","with":{"diagnostics":"summary","fail-on-cache-error":true,"mode":"ccache","save-always":true,"trust-policy":"auto"}},{"if":"matrix.preset == 'linux-gcc-release' || matrix.preset == 'linux-clang-release'","name":"Upload packages","uses":"actions/upload-artifact@v7","with":{"if-no-files-found":"error","name":"packages-${{ matrix.preset }}","path":"${{ github.workspace }}/_artifacts/*","retention-days":14}}]
 FIXPP_USES_EOF
 )"
   got="$(echo "$json" | jq -cS '.linux_uses')"
@@ -890,9 +890,18 @@ $got"
   #     is expected rather than a second defect.
   # Conclusion: it cannot change what the pytest pair executes; it can only
   # prevent them from executing at all, loudly.
+  #
+  # 32 -> 33 (BoringCache issue #411 validation): installing ccache and its
+  # official HTTP storage helper is now a separate shell step because
+  # BoringCache does not install either prerequisite. The step downloads two
+  # versioned archives, verifies their fixed SHA-256 digests, and installs only
+  # the two executables. It does not write GITHUB_ENV or GITHUB_PATH, and its
+  # step-level env ends with the step. A failed download, digest check, or
+  # install stops the job before Conan or pytest; a successful install changes
+  # only which ccache and storage-helper binaries later compiler invocations use.
   got="$(echo "$json" | jq -r '.linux_step_count')"
-  [ "$got" = "32" ] \
-    || fail "$case_id: the linux job has $got steps, expected 32. A step added anywhere before the pytest pair can change what they execute without colliding with a pinned name or adding a pytest mention (round 4 finding 3, measured). This count is deliberately brittle: adding a step to this job is a deliberate act and must be paired with a deliberate look at whether it reaches the python steps."
+  [ "$got" = "33" ] \
+    || fail "$case_id: the linux job has $got steps, expected 33. A step added anywhere before the pytest pair can change what they execute without colliding with a pinned name or adding a pytest mention (round 4 finding 3, measured). This count is deliberately brittle: adding a step to this job is a deliberate act and must be paired with a deliberate look at whether it reaches the python steps."
 
   got="$(echo "$json" | jq -cS '.linux_job_env')"
   [ "$got" = '{"CCACHE_COMPILERCHECK":"content","CCACHE_COMPRESSLEVEL":"5","CCACHE_DIR":"/tmp/fixpp-ccache-${{ matrix.preset }}","CMAKE_CXX_COMPILER_LAUNCHER":"ccache","CMAKE_C_COMPILER_LAUNCHER":"ccache"}' ] \
@@ -2006,13 +2015,13 @@ open(dst, "w").write(t.replace(old, new))
   # ⚠️ The inserted step deliberately writes NOTHING. An earlier version wrote
   # $GITHUB_ENV, which tripped the writer census first and left the step count
   # with no mutant of its own — the shadowing round 5 finding 3 is about.
-  # ⚠️ THE LITERAL TRACKS THE BASELINE. Bumped 31->32 by #252's
-  # `Assert the dependency closure is instrumented` step; the mutant inserts one
+  # ⚠️ THE LITERAL TRACKS THE BASELINE. Bumped 32->33 by the BoringCache
+  # prerequisite-install step; the mutant inserts one
   # more, so the message it must produce moves with it. A stale literal here does
   # not fail open — `mutate_workflow` reports "failed the pin for the WRONG
   # reason" — but it is the second edit the count pin demands, and forgetting it
   # is how a deliberately brittle assertion earns a reputation for being noise.
-  mutate_workflow M33 "an unnamed step is inserted before the pytest pair" "has 33 steps, expected 32" '
+  mutate_workflow M33 "an unnamed step is inserted before the pytest pair" "has 34 steps, expected 33" '
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 t = open(src).read()
