@@ -26,5 +26,3 @@ jobs:
 
       - name: Connect this repository through GitHub OIDC
         run: boringcache ci connect --oidc-provider github-actions
-        env:
-          BORINGCACHE_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_RESTORE_TOKEN }}

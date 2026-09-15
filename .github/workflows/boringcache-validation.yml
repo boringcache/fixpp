@@ -48,7 +48,7 @@ jobs:
           wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
           ci/apt-guard.sh llvm-toolchain -- sudo /tmp/llvm.sh 22 all
-          CLANG_BIN=$(find /usr/bin -maxdepth 1 -type f -name 'clang++-*' -print | sort -V | tail -1)
+          CLANG_BIN=$(find /usr/bin -maxdepth 1 \( -type f -o -type l \) -name 'clang++-*' -print | sort -V | tail -1)
           CLANG_VER=${CLANG_BIN##*-}
           test -n "$CLANG_VER"
           sudo ln -sf "/usr/bin/clang-$CLANG_VER" /usr/bin/clang
@@ -90,9 +90,6 @@ jobs:
           mode: ccache
           diagnostics: summary
           fail-on-cache-error: true
-        env:
-          BORINGCACHE_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_RESTORE_TOKEN }}
-          BORINGCACHE_SAVE_TOKEN: ${{ secrets.BORINGCACHE_SAVE_TOKEN }}
 
       - name: Resolve Conan dependencies
         run: |
@@ -151,7 +148,7 @@ jobs:
           wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
           ci/apt-guard.sh llvm-toolchain -- sudo /tmp/llvm.sh 22 all
-          CLANG_BIN=$(find /usr/bin -maxdepth 1 -type f -name 'clang++-*' -print | sort -V | tail -1)
+          CLANG_BIN=$(find /usr/bin -maxdepth 1 \( -type f -o -type l \) -name 'clang++-*' -print | sort -V | tail -1)
           CLANG_VER=${CLANG_BIN##*-}
           test -n "$CLANG_VER"
           sudo ln -sf "/usr/bin/clang-$CLANG_VER" /usr/bin/clang
@@ -193,8 +190,6 @@ jobs:
           mode: ccache
           diagnostics: summary
           fail-on-cache-error: true
-        env:
-          BORINGCACHE_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_RESTORE_TOKEN }}
 
       - name: Resolve Conan dependencies
         run: |
