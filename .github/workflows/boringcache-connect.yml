@@ -1,0 +1,30 @@
+name: Connect BoringCache validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  connect:
+    if: github.repository == 'boringcache/fixpp' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the released BoringCache CLI
+        run: |
+          curl -fsSL https://install.boringcache.com/install.sh -o "$RUNNER_TEMP/install-boringcache.sh"
+          sh "$RUNNER_TEMP/install-boringcache.sh"
+
+      - name: Connect this repository through GitHub OIDC
+        run: boringcache ci connect --oidc-provider github-actions
+        env:
+          BORINGCACHE_RESTORE_TOKEN: ${{ secrets.BORINGCACHE_RESTORE_TOKEN }}
