@@ -1644,6 +1644,7 @@ jobs:
     permissions:
       contents: read
       packages: write  # #259: publish this lane's ccache to GHCR on push:main / dispatch on main
+      id-token: write  # BoringCache authenticates this trusted validation run through GitHub OIDC
     # CI-6: cibuildwheel builds the whole statically-linked engine + static
     # OpenSSL in-container; generous backstop against a hung build wedging the runner.
     timeout-minutes: 180
