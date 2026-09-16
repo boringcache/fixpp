@@ -1808,6 +1808,9 @@ jobs:
           fail-on-cache-error: true
           save-always: true
 
+      - name: Zero ccache stats after the restore
+        run: ccache --zero-stats
+
       # CI-3: persist the IN-CONTAINER Conan cache. cibw-before-all.sh runs
       # `conan install` inside the manylinux container, whose home is separate
       # from the host. Mount a host dir as the container's CONAN_HOME and cache
