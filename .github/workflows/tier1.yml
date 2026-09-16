@@ -600,6 +600,9 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
+      - name: Exclude the validation plan from source status
+        run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
+
       - name: Use BoringCache for the shared Tier 1 compiler cache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
         with:
@@ -1428,6 +1431,9 @@ jobs:
           sparse-checkout: .boringcache.toml
           sparse-checkout-cone-mode: false
           persist-credentials: false
+
+      - name: Exclude the validation plan from source status
+        run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
 
       - name: Use BoringCache for the shared Tier 1 compiler cache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
@@ -2950,6 +2956,9 @@ jobs:
           sparse-checkout: .boringcache.toml
           sparse-checkout-cone-mode: false
           persist-credentials: false
+
+      - name: Exclude the validation plan from source status
+        run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
 
       - name: Restore the shared Tier 1 compiler cache through BoringCache
         uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
