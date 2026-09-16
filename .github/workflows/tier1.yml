@@ -1783,26 +1783,29 @@ jobs:
       - name: Install ccache (host side)
         run: sudo ci/install-ccache.sh /usr/local/bin
 
-      - name: Set up oras
-        uses: oras-project/setup-oras@v2
+      - name: Checkout the BoringCache validation plan
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          ref: boringcache-validation
+          path: .boringcache-plan
+          sparse-checkout: .boringcache.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
-      # `oras login` before the pull — a package first created by GITHUB_TOKEN is
-      # private, and an anonymous pull would 401 and read as a permanent MISS
-      # with no other symptom. `|| true` because a fork PR's downgraded token
-      # cannot log in, and the anonymous attempt is the correct fallback there.
-      # Same shape as tier3-libcxx.yml's restore step.
-      #
-      # Ordering: BEFORE the build, obviously — but also before the Conan cache
-      # step below is harmless, because unlike Tier 3 this lane's dependency
-      # closure is built inside the container by cibw-before-all.sh and does not
-      # route through the host launcher.
-      - name: Restore ccache from GHCR
+      - name: Exclude the validation plan from source status
+        run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
+
+      - name: Restore the wheel ccache from BoringCache
         id: ccache_restore
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin || true
-          ci/restore-ccache.sh \
-            "${{ steps.wheel_ident.outputs.lane }}" \
-            "${{ steps.wheel_ident.outputs.image_ref }}"
+        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
+        with:
+          working-directory: .boringcache-plan
+          trust-policy: auto
+          mode: archive
+          cache-profiles: wheel-ccache
+          diagnostics: summary
+          fail-on-cache-error: true
+          save-always: true
 
       # CI-3: persist the IN-CONTAINER Conan cache. cibw-before-all.sh runs
       # `conan install` inside the manylinux container, whose home is separate
@@ -1927,35 +1930,9 @@ jobs:
         run: |
           ci/ccache-stats.sh \
             "${{ steps.wheel_ident.outputs.lane }}" \
-            "${{ steps.ccache_restore.outputs.hit }}" \
+            "${{ steps.ccache_restore.outputs.cache-hit }}" \
             "${{ steps.wheel_build.outcome }}" \
             70
-
-      # Publish only from main, and only when the cache actually CHANGED.
-      #
-      # `changed` reads ccache's `local_storage_write`, not `misses`:
-      # `cache_miss == 0` does NOT prove ccache wrote nothing (measured against
-      # 4.9.1 — a same-line-count edit yields cache_miss=0 with a real manifest
-      # write). Without the guard, a CI- or docs-only push to main re-tars and
-      # re-uploads the whole cache to publish a byte-equivalent artifact and
-      # orphans another untagged version for the pruner.
-      #
-      # Ref-restricted to main so no branch can publish into the namespace main
-      # consumes — load-bearing here because the tag is COARSE and ROLLING:
-      # every branch computes the identical tag whatever it changed.
-      - name: Save ccache to GHCR (push:main / dispatch on main, cache changed)
-        if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && steps.ccache_stats.outputs.changed != '0'
-        continue-on-error: true
-        env:
-          # Prune needs `delete:packages`, which GITHUB_TOKEN does NOT carry —
-          # verified 403 against the live API. Without GHCR_PAT the backlog is
-          # reported into the job summary instead of accumulating silently.
-          GH_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          ci/seed-ccache.sh \
-            "${{ steps.wheel_ident.outputs.lane }}" \
-            "${{ steps.wheel_ident.outputs.image_ref }}"
 
       # T011 / SC-004 / LAY-3: exactly ONE wheel, tagged cp312-abi3 + manylinux,
       # external-library list EMPTY (static everything).
