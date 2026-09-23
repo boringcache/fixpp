@@ -56,6 +56,7 @@ add_wire_test(wire_pure_tests
   accessor_smoke_test.cpp                                             # T055-R2
   tag_scan_test.cpp                                                   # T004 (040)
   hostile_input_hardening_test.cpp                                    # wire-hostile-input-review
+  length_data_expansion_test.cpp                                      # fixpp#426
   offset_table_overflow_test.cpp                                      # T008/T012 (040)
   parser_overflow_test.cpp                                            # T009/T012 (040)
   group_slice_trailing_soh_test.cpp                                   # T008 (062)
@@ -121,12 +122,15 @@ add_executable(wire_dict_tests
   validator_production_table_view_test.cpp
   validator_nested_membership_test.cpp
   message_view_membership_copy_test.cpp
+  message_view_shared_membership_test.cpp                             # T-7/T-8 (fixpp#495)
   validator_enum_domain_test.cpp                                      # T022/T022a/T023 (075)
   validator_enum_multivalue_test.cpp                                  # T027 (075)
   fixt_header_validate_test.cpp                                       # T003/T004 (081)
   delimiter_divergence_wire_test.cpp                                  # T009 (083)
   consume_group_nested_delim_test.cpp                                 # T010 (083)
-  typed_read_split_agreement_test.cpp)                                # T011 (083)
+  typed_read_split_agreement_test.cpp                                 # T011 (083)
+  length_data_pairs_drift_test.cpp                                    # fixpp#426 (D-1)
+  dict_hooks_custom_pair_test.cpp)                                    # fixpp#426 (D-2)
 target_link_libraries(wire_dict_tests PRIVATE
   fixpp_wire
   fixpp_dictionary
@@ -136,12 +140,13 @@ target_include_directories(wire_dict_tests PRIVATE
   "${CMAKE_SOURCE_DIR}/tests")
 target_compile_definitions(wire_dict_tests PRIVATE
   "FIXPP_DICT_DATA_DIR=\"${CMAKE_SOURCE_DIR}/dictionaries\"")
-# 389: FIXPP_TEST_HOOKS was defined here for exactly one reason — W-10 read the
-# private group_slices_reserve_bound() through the gated friend seam. That
-# function, the seam, and the probe are all gone, and no source in this bucket
-# uses a gated hook any more (nested_group_slices_failloud_test.cpp, the only
-# remaining hook consumer in tests/wire, is in a DIFFERENT bucket and keeps its
-# own define). Dropped rather than left defined-but-unused.
+# 389: FIXPP_TEST_HOOKS used to be dropped here — W-10's only consumer (the
+# gated group_slices_reserve_bound() friend seam) was deleted along with the
+# function it read. fixpp#426 reintroduces a consumer:
+# typed_read_split_agreement_test.cpp's half-threaded dict_hooks probes need
+# `dict_hooks_test_access::make`, which is itself FIXPP_TEST_HOOKS-gated
+# (dict_hooks.hpp's `friend struct dict_hooks_test_access`).
+target_compile_definitions(wire_dict_tests PRIVATE FIXPP_TEST_HOOKS)
 add_test(NAME wire_dict_tests COMMAND wire_dict_tests)
 # 075 (tasks.md Test-binary discipline note): sets LABELS on the buckets it
 # joins/adds. wire_dict_tests is a grouped add_test binary — one label set
@@ -283,6 +288,32 @@ if(TARGET fixpp_codegen_generate AND FIXPP_CODEGEN_FIX_LATEST)
     "${CMAKE_SOURCE_DIR}/tests"
     "${CMAKE_BINARY_DIR}/_codegen/include"
   )
+  # ⚠️ PER-TARGET, PER-WARNING CARVE-OUT (#439) — NOT an exemption from -Werror.
+  #
+  # At -O3 GCC 13 reports `-Wnonnull` ("argument 1 null where non-null expected")
+  # for the __builtin_memmove inside std::vector<std::byte, pmr-alloc>'s
+  # _M_assign_aux. Argument 1 is the DESTINATION — the vector's own freshly
+  # allocated buffer — and the whole `inlined from` chain lies inside libstdc++
+  # with no line of this repo named. It is an instantiation artifact of this one
+  # TU -- a sweep of every hand-written TU in the compile database reproduced it
+  # here and nowhere else.
+  #
+  # It was NOT dismissed on shape. The one attributable hypothesis — that the
+  # copied span could be empty, so reify.cpp's `bytes_.assign(sb.begin(),
+  # sb.end())` passes a null source — was TESTED by guarding that call with
+  # `if (!sb.empty())` and re-compiling: the diagnostic is UNCHANGED. So the
+  # source span is not what GCC is complaining about, and the guard was reverted
+  # rather than left in as a fix that fixes nothing.
+  #
+  # -Wno-error= and not -Wno-: the warning stays VISIBLE in the build log, so a
+  # future GCC that starts attributing it to real code is not silenced here.
+  #
+  # Re-derive: replay this TU's own compile command from
+  # build/linux-gcc-release/compile_commands.json, dropping -o/-MD/-MF, and
+  # grep the stderr for -Wnonnull. If it is gone, delete this block.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(wire_vlatest_reify_roundtrip_test PRIVATE -Wno-error=nonnull)
+  endif()
   add_test(NAME wire_vlatest_reify_roundtrip_test COMMAND wire_vlatest_reify_roundtrip_test)
   set_tests_properties(wire_vlatest_reify_roundtrip_test PROPERTIES LABELS "076;vlatest_roundtrip")
 endif()

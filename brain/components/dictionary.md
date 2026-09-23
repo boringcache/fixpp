@@ -7,11 +7,28 @@ refs:
   - src/dictionary/xml_loader.cpp
   - src/dictionary/orchestra_loader.cpp
   - src/dictionary/version_registry.cpp
+  - src/dictionary/reify.cpp
+  - include/fixpp/dict/reify.hpp
   - .specify/2c-codegen.md
   - .specify/215-dictionary-view.md
+  - .specify/495-493-486-dict-reify-copy.md
+  - .specify/456-table-view-seal.md
+  - .specify/447-458-452-capi-refusals.md
+  - specs/090-capi-refusals/contracts/msg-clone.md
+  - specs/090-capi-refusals/data-model.md
+  - specs/090-capi-refusals/quickstart.md
+  - specs/090-capi-refusals/spec.md
+  - specs/090-capi-refusals/tasks.md
+  - specs/057-behavioral-reify-unblock/data-model.md
+  - specs/057-behavioral-reify-unblock/plan.md
+  - specs/057-behavioral-reify-unblock/research.md
+  - specs/057-behavioral-reify-unblock/contracts/reify-dispatch-bridge.md
+  - spec/behaviors-and-limitations.md
 refs_external:
   - research/G19-fix-fpml-iso20022/decisions/2c-codegen.md
-codegraph_entry: [Dictionary, xml_loader, orchestra_loader, field_traits, version_registry]
+  - research/G19-fix-fpml-iso20022/decisions/speckit/090-capi-refusals-gatea.md
+  - research/G19-fix-fpml-iso20022/decisions/speckit/090-capi-refusals-implement-log.md
+codegraph_entry: [Dictionary, xml_loader, orchestra_loader, field_traits, version_registry, table_view_builder]
 constitution: ["§I.1"]
 ---
 
@@ -36,7 +53,11 @@ A real subsystem, not a thin layer: **two independent loaders** — `xml_loader.
 XML) and `orchestra_loader.cpp` (FIX Orchestra) — plus `reify.cpp`, `field_traits.cpp`,
 `version_registry.cpp`, `version_profile.cpp`, `dictionary_snapshot.cpp` and a
 `reify_dispatch_bridge`. **Two owning design docs**: `2c-codegen.md` (header layout, multi-version
-coexistence, dialect overlay binding) and `215-dictionary-view.md`.
+coexistence, dialect overlay binding) and `215-dictionary-view.md`. ⚠️ 215's alias design — §3's
+`shared_dictionary_view` forming an aliasing pointer, §5b's "third owner of the snapshot's control
+block", §6 seam 7's G2 count of one — is **superseded in part** by
+`.specify/495-493-486-dict-reify-copy.md` §6 (D-4): the snapshot owns its table in the table's own
+control block and G2 asserts zero matches. The passkey and the provenance check stand.
 
 ⚠️ **Counts and file lists rot.** Derive the current surface from the graph index; the point above is
 the *shape* — two loader front-ends converging on one dictionary representation, with codegen on top.
@@ -154,6 +175,130 @@ test silently vanishing from the suite.
 considered and NOT done.** It would change key types in an installed public header and touch every
 consumer, which is a different change from the one that fixed #264. The assertion is the proportionate
 guard for a footgun that is real but currently unreachable.
+
+## Length+Data pairs from Orchestra `lengthId` (#427)
+
+The Orchestra loader reads `lengthId`, so `Dictionary::length_pair_data_tag` answers for
+FIX Latest (B-427-1). The standard pair table (`include/fixpp/core/length_data_pairs.hpp`)
+is drift-tested against the union of all ten dictionaries. A dictionary's own pair matters
+only when neither of its tags is standard (B-426-3).
+
+⚠️ **The table lives in `core`, not `wire`.** `table_view` must classify a tag, and the
+dictionary layer may not include wire ([arch §2.3]); `include/fixpp/wire/length_data_pairs.hpp`
+survives as a re-export of the same names, so a reader who follows an older pointer lands on
+using-declarations rather than the table. ⚠️ `tools/check_layers.py` walks `src/` and
+`bindings/` only, so a dictionary **header** including a wire header passes it **silently** —
+the move was made for correctness, not because a gate demanded it.
+
+`table_view` carries one `bool` — some registered pair has **both** tags outside the standard
+table — because `wire::dict_hooks::for_table_view` installs the pair callback **only** when it
+is set, and that bundle is built per message. What was rejected: a sixth `dict_hooks` pointer to
+an inline 8 KiB bitset (contradicted design §3's five fields and `table_view`'s own
+footprint-sized structure), and computing the predicate inside `for_table_view` (it is on
+per-message paths). `set_length_pair_data_tag` is strongly exception-safe at **O(1)** — an
+earlier transactional version copied both maps per registered pair and made
+`Dictionary::as_table_view()` quadratic (+26.3 % on FIX42); do not reintroduce it. Zero is
+refused on **both** halves, at the setter *and* at pair formation in both loaders, because zero
+is the "no pair" answer of every accessor.
+
+⚠️ **fixpp#457 then moved the refusal UPSTREAM of all three, and that changed which of them a
+test can still reach** — the kind of thing a page like this exists to record, because the guards
+are still in the source and read as live. A field numbered 0 is now refused at DECLARATION in
+both loaders, upstream of both guards.
+
+**Do not read either guard as a witnessed path, and do not take a reachability verdict from this
+page** — derive it, because the two halves differ and the difference follows from where each value
+comes from: a `data_tag` is a key of the loader's own field store, which the declaration rule bars
+from zero; a `length_tag` comes from a `lengthId=` reference, parsed with the shared
+`parse_orchestra_id` (which must keep admitting zero for the structural-id namespace) and resolved
+*after* the declaration check. The recipe: read `parse_document` / `collect_fields` call order and
+ask, for each argument, whether it originates in a declaration or in a reference. The guards are
+kept as boundary conditions — zero is the "no pair" answer of the accessors, which is a property of
+the accessors rather than of today's callers.
+
+⚠️ **This closes a disposition `specs/002-dictionary-xml-loader` deferred for itself.** That spec's
+§10 **follow-up F4** and its `CHK017` checklist row both list `<field number="0">` as an XML-grammar
+edge case left undecided in v1.0 ("rejected vs accepted" unstated). The bundle is frozen, so it
+still reads as open; the answer is REJECTED, here and in `B-457-1`. Pointer lives here because a
+frozen bundle cannot carry it. The decision that keeps the
+rule off the shared parser is the load-bearing one: `<fixr:component id>` / `<fixr:group id>`
+are a repository-local surrogate key where `id="0"` is legal, so the Orchestra rule lives in
+`parse_orchestra_field_tag` and the false-positive arm
+(`OrchestraFailClosed.ZeroStructuralXmlIdsAreStillAccepted`) is what holds the two namespaces
+apart. **`table_view`'s own mutator surface was the residue, and fixpp#456 MOVED it rather than
+closing it.** The population members are private now and reachable only through
+`table_view_builder` — `include/fixpp/dict/table_view.hpp`'s STORAGE banner states the mechanism,
+and is the one place that does. The *hazard* is unchanged: the builder accepts everything the view
+used to, and `build()` is `return std::move(tv_);` with no validation of any kind, so a hand-built
+table can still plant a zero where a loaded dictionary cannot. That is why `B-384-2` was **amended,
+not closed** — its wording now names the `table_view_builder` surface instead of the hand-built
+view — and why `L-456-1` was filed beside it.
+
+## The reify handle materialises EAGERLY and refuses a failed re-parse (090, fixpp#458)
+
+`fixpp::dict::detail::owning_message_handle_from_frame` (`src/dictionary/reify.cpp`) builds the
+handle's view when it mints the handle. Before 090 the build happened lazily, on the first `view()`.
+When a dict-backed source's re-parse fails, the factory now returns that wire error through its
+`expected_t` channel, and so do `reify()` and the generated dispatch. Before, it fell back silently
+to a dict-free view that lost the dictionary's Length+Data pairs. This is `B-458-2`, BREAKING for a
+direct C++ caller. The C-ABI twin is `fixpp_msg_clone`; see [`c-api.md`](./c-api.md).
+
+- **Why eager.** `view()` is a `noexcept` accessor that returns a reference, so a refusal found
+  lazily had nowhere to go. The factory already had a refusal channel (`dict_reify_oom`). It simply
+  ran the fallible work later. The design note's v0.1 had called that deferral a source fact rather
+  than a choice.
+- **Rejected:** v0.1's three-state status accessor on the handle. It could not report a framing
+  failure, and it could not be both non-allocating and post-materialisation.
+- **Kept as it was, on purpose:** a framing failure, a framed-but-empty span, and a dict-free view's
+  degraded build still return a live handle. Only the re-parse of a frame that framed successfully
+  refuses (`include/fixpp/dict/reify.hpp`'s factory comment). `.specify/2c-codegen.md`'s reify
+  error entry carries an in-place *"Updated (fixpp#458 …)"* note saying the same.
+- **What eager costs, measured at Gate B (PR #494).**
+  - **The moved work is not new work:** the framer pass plus the dict-backed parse used to run on the first `view()`, and a caller that reads the handle pays it either way.
+  - **It is a small fraction of the factory call.** The factory is dominated by the per-handle `membership_copy()`, which predates 090.
+  - ⚠️ **The benchmark that existed before could not see any of this.** `BM_Reify_Dispatch_20tag` passes a view with no MsgType, so `reify()` returns before dispatch. `BM_Reify_DictBacked_20tag` was added to reach the factory. Check that a bench reaches the path it is named for before citing it.
+  - **One pre-existing row still went past +5%**, from code *placement*: the function's instructions were identical and its alignment moved.
+  - **Rejected:** forcing alignment or moving the function to a separate file to recover it. Either would tune the code to one benchmark and move the layout luck elsewhere.
+  - `[const §VIII.2]` makes accepting it a non-author decision. The figures and procedure are in the 090 verify record's *Gate B G-1* section.
+- **fixpp#495 / #493 (`.specify/495-493-486-dict-reify-copy.md`):** the factory no longer
+  deep-copies the membership table for a view parsed on `Parser`'s **owned route** (every view the
+  `Session` hands an application, and every handle's own view); the handle holds one more reference
+  to that table, and pins the table only — never the `Dictionary` (D-4). The handle's impl comes
+  from `mr` (D-1c). Every copy re-parses under its source's `OffsetTable::Config` (#493). Rejected:
+  a public owned route (R-A keeps it `detail`), a `shared_ptr` by value on every view (an atomic
+  pair per inbound message), and the owner token inside `dict_hooks` (size-pinned `entry_context`).
+  A view parsed through a borrowed `Parser{tv}` still copies (`L-495-1`).
+- ⚠️ **Superseded in part (fixpp#493):** 090 made a dict-backed clone of a raised-cap source
+  refuse with `FIXPP_ERR_WIRE_LIMIT_EXCEEDED`. Frozen 090 records that still describe that
+  refusal, flagged here and not edited (frozen `specs/` are not rewritten):
+  `specs/090-capi-refusals/contracts/msg-clone.md` §4 and `data-model.md` §4.1 (the
+  `wire_offset_table_full` "raised-cap route" row), `quickstart.md` V5, `spec.md` User Story 3's
+  *Independent Test*, and `tasks.md` US3 / T047 all describe a source parsed at a raised
+  `max_offset_entries` making a dict-backed `fixpp_msg_clone` return
+  `FIXPP_ERR_WIRE_LIMIT_EXCEEDED`. Since #493 that clone succeeds under the source's own caps:
+  `.specify/495-493-486-dict-reify-copy.md` §4 and T-3. The code still comes back for a source
+  whose own build failed at the default cap (T-6).
+- ⚠️ **Superseded in part (fixpp#495 D-1c):** frozen 057 records describe the
+  `owning_message_handle` as a **heap** pimpl, flagged here and not edited (frozen `specs/` are
+  not rewritten): `specs/057-behavioral-reify-unblock/data-model.md` E-1, `plan.md`,
+  `research.md` and `contracts/reify-dispatch-bridge.md`. Since #495 the impl is allocated from
+  the `mr` passed to `reify`, not the global heap: `.specify/495-493-486-dict-reify-copy.md` §2.5
+  (D-1c), the `include/fixpp/dict/reify.hpp` class comment, and `B-495-4`. Re-derive the sites
+  with `git grep -n -i 'heap pimpl' -- specs/057-behavioral-reify-unblock`.
+- ⚠️ **Open residuals:** `L-458-1` covers a dict-backed build that under-indexes near the probe cap
+  while reporting success; `L-495-1` the borrowed-route copy. Check the live B&L file before
+  treating either as open.
+
+> ⚠️ **Before you write "immutable" about a `table_view`, read that banner.** #456 took three Gate B
+> rounds and found **zero** code defects across all three; every finding was prose claiming more than
+> the type delivers. What the seal buys is reachability of the population members. It does not make
+> the object unwritable: the `std::uint16_t` elements behind the span accessors are allocated by the
+> member vectors and are not `const` objects, so a `const_cast` and a write through it is defined
+> behaviour — on a `const` view as much as a non-`const` one. Declaring the view `const` closes
+> move-from and `optional::emplace` re-seating, and not that. The rejected alternatives are worth
+> knowing too: a runtime `frozen_` flag, freezing at `as_table_view()`, and a facade over a reference
+> all died to the same discriminator — #456's witness mutates a *default-constructed* view, so any
+> design leaving a reachable mutation surface on a `table_view` **value** fails it.
 
 ## Where the design decisions live
 

@@ -36,17 +36,18 @@
 // no liveness token. Reads (incl. get_group) are THREAD_SAFE and leak-free.
 
 #include <algorithm>
-#include <cassert>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fixpp/core/decimal.hpp>  // decimal_traits<pod_decimal>::from_chars — set_double fail-closed guard
 #include <fixpp/dict/dictionary.hpp>
 #include <fixpp/dict/field_ref.hpp>
-#include <fixpp/session/session.hpp>  // session_arena()
-#include <fixpp/wire/framer.hpp>      // frame_view / frame_view_access
-#include <fixpp/wire/parser.hpp>      // MessageView
+#include <fixpp/session/session.hpp>         // session_arena()
+#include <fixpp/wire/framer.hpp>             // frame_view / frame_view_access
+#include <fixpp/wire/length_data_check.hpp>  // fixpp#428: commit-time pair rule
+#include <fixpp/wire/parser.hpp>             // MessageView
 #include <memory>
 #include <memory_resource>
 #include <new>
@@ -193,6 +194,24 @@ static fixpp_error_t check_dict(const fixpp_msg* h, uint16_t tag,
     return FIXPP_ERR_OK;
 }
 
+// ── Length+Data pairs (fixpp#428, design .specify/426-428-length-data-pairs.md §5) ──
+
+// The pairs a handle is judged against: its session's dictionary when it has one,
+// else the standard table alone (design §5.1). Aliases *h->session_tv_, which the
+// handle keeps alive.
+static fixpp::wire::dict_hooks pair_hooks(const fixpp_msg* h) noexcept {
+    return h->session_tv_ ? fixpp::wire::dict_hooks::for_table_view(*h->session_tv_)
+                          : fixpp::wire::dict_hooks::none();
+}
+
+// §5.1: SOH is well-formed only inside a Data value; anywhere else it starts a new
+// field in the serialised payload.
+static bool soh_outside_data(const fixpp::wire::dict_hooks& hooks, uint16_t tag,
+                             const std::byte* data, std::size_t len) noexcept {
+    return hooks.length_tag_for_data(tag) == 0 &&
+           std::find(data, data + len, std::byte{0x01}) != data + len;
+}
+
 // ── AccumulatorEntry helpers ──────────────────────────────────────────────────
 
 // Upsert: find or create an AccumulatorEntry for `tag`.
@@ -205,6 +224,43 @@ static AccumulatorEntry& upsert_entry(std::pmr::vector<AccumulatorEntry>& entrie
     entries.emplace_back(mr);
     entries.back().tag = tag;
     return entries.back();
+}
+
+// §5.2: writes a Length+Data pair into `fields` without moving any existing entry,
+// because open group builders and entries hold indices into these vectors. Neither
+// half present: append the Length, then the Data. Both present with the Length right
+// before the Data: overwrite both. Any other state: TYPE_MISMATCH, nothing written.
+static fixpp_error_t upsert_pair(std::pmr::vector<AccumulatorEntry>& fields,
+                                 std::pmr::memory_resource* mr, uint16_t length_tag,
+                                 uint16_t data_tag, const std::byte* data, std::size_t len) {
+    const auto index_of = [&fields](uint16_t tag) {
+        return static_cast<std::size_t>(
+            std::ranges::find_if(fields,
+                                 [tag](const AccumulatorEntry& e) { return e.tag == tag; }) -
+            fields.begin());
+    };
+    const std::size_t li = index_of(length_tag);
+    const std::size_t di = index_of(data_tag);
+    const bool has_length = li != fields.size();
+    const bool has_data = di != fields.size();
+    if (has_length != has_data || (has_length && di != li + 1)) return FIXPP_ERR_TYPE_MISMATCH;
+
+    char digits[24];
+    const auto* digits_end = std::to_chars(digits, digits + sizeof(digits), len).ptr;
+    const auto* length_bytes = reinterpret_cast<const std::byte*>(digits);
+    const auto length_size = static_cast<std::size_t>(digits_end - digits);
+    if (!has_length) {
+        fields.emplace_back(mr);
+        fields.back().tag = length_tag;
+        fields.back().value_bytes.assign(length_bytes, length_bytes + length_size);
+        fields.emplace_back(mr);
+        fields.back().tag = data_tag;
+        fields.back().value_bytes.assign(data, data + len);
+        return FIXPP_ERR_OK;
+    }
+    fields[li].value_bytes.assign(length_bytes, length_bytes + length_size);
+    fields[di].value_bytes.assign(data, data + len);
+    return FIXPP_ERR_OK;
 }
 
 // ── Serialisation helpers ─────────────────────────────────────────────────────
@@ -260,6 +316,12 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_create_outbound(fixpp_session_t* sessio
             }
         }
         if (!found) return FIXPP_ERR_DICT_CONFIG;
+    }
+    // fixpp#428: commit writes MsgType verbatim as `35=<msg_type><SOH>`, so a SOH in it
+    // injects fields, and an empty one is malformed. A dictionary already refuses both
+    // above (no declared MsgType is empty or holds SOH); this covers dict-free sessions.
+    if (mt.empty() || mt.find('\x01') != std::string_view::npos) {
+        return FIXPP_ERR_WIRE_CONFORMANCE;
     }
 
     // Construction-time thunk: allocate the outbound handle + a per-message arena
@@ -378,119 +440,165 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_clone(const fixpp_msg_t* src, fixpp_msg
         return FIXPP_ERR_INVALID_HANDLE;
     }
 
-    // Construction-time thunk: catch→translate.
-    try {
-        // Get the source's raw wire bytes.
-        auto src_bytes = h->view->bytes();  // span<const byte> aliasing the source frame
-        std::size_t frame_len = src_bytes.size();
+    // fixpp#458 (090-capi-refusals) D-3b: a NESTED exception boundary,
+    // not three peers (contracts/msg-clone.md §8). The OUTER catch(...) is
+    // what makes clone's abort outcome exist at all -- narrowing straight to
+    // catch(std::bad_alloc const&) with nothing outside would let a
+    // std::logic_error or a foreign exception leave this extern "C" function.
+    // Clone STAYS a steady-state symbol ([2i §5.2]'s construction-time
+    // whitelist is NOT amended); matches the shipped idiom already carried by
+    // src/capi/session.cpp's fixpp_session_send / fixpp_session_acceptor_
+    // bound_endpoint (FR-008).
+    try {  // OUTER
+        // INNER: clone's construction. std::bad_alloc is a documented,
+        // preserved refusal (EC-4, §3.2) -- narrowed from the blanket catch
+        // this replaces.
+        try {
+            // Get the source's raw wire bytes.
+            auto src_bytes = h->view->bytes();  // span<const byte> aliasing the source frame
+            std::size_t frame_len = src_bytes.size();
 
-        // Allocate a new owned frame buffer (deep copy).
-        auto owned_frame = std::make_unique<std::byte[]>(frame_len);
-        std::memcpy(owned_frame.get(), src_bytes.data(), frame_len);
+            // Allocate a new owned frame buffer (deep copy).
+            auto owned_frame = std::make_unique<std::byte[]>(frame_len);
+            std::memcpy(owned_frame.get(), src_bytes.data(), frame_len);
 
-        // Locate the "9=" and "10=" boundaries to compute body_off / body_len
-        // for the frame_view we build over the cloned bytes. Uses the
-        // fixpp::wire::frame_view_access helper defined above in this TU.
-        auto mk_fv = [](const std::byte* buf,
-                        std::size_t len) -> std::optional<fixpp::wire::frame_view> {
-            constexpr char SOH = '\x01';
-            std::string_view s{reinterpret_cast<const char*>(buf), len};
-            std::size_t p9 = s.starts_with("9=") ? 0
-                                                 : s.find(
-                                                       "\x01"
-                                                       "9=");
-            if (p9 == std::string_view::npos)
-                return std::nullopt;  // LCOV_EXCL_LINE — valid inbound view always has 9=
-            if (s[p9] == SOH) ++p9;
-            std::size_t soh9 = s.find(SOH, p9);
-            if (soh9 == std::string_view::npos)
-                return std::nullopt;  // LCOV_EXCL_LINE — valid inbound view has SOH after 9=NNN
-            std::size_t body_off = soh9 + 1;
-            std::size_t p10 = s.find(
-                "\x01"
-                "10=",
-                body_off);
-            if (p10 == std::string_view::npos)
-                return std::nullopt;  // LCOV_EXCL_LINE — valid inbound view always has 10=
-            std::size_t body_len = (p10 + 1) - body_off;
-            return fixpp::wire::frame_view_access::make(buf, len, body_off, body_len);
-        };
+            // Locate the "9=" and "10=" boundaries to compute body_off / body_len
+            // for the frame_view we build over the cloned bytes. Uses the
+            // fixpp::wire::frame_view_access helper defined above in this TU.
+            auto mk_fv = [](const std::byte* buf,
+                            std::size_t len) -> std::optional<fixpp::wire::frame_view> {
+                constexpr char SOH = '\x01';
+                std::string_view s{reinterpret_cast<const char*>(buf), len};
+                std::size_t p9 = s.starts_with("9=") ? 0
+                                                     : s.find(
+                                                           "\x01"
+                                                           "9=");
+                if (p9 == std::string_view::npos)
+                    return std::nullopt;  // LCOV_EXCL_LINE — valid inbound view always has 9=
+                if (s[p9] == SOH) ++p9;
+                std::size_t soh9 = s.find(SOH, p9);
+                if (soh9 == std::string_view::npos)
+                    return std::nullopt;  // LCOV_EXCL_LINE — valid inbound view has SOH after 9=NNN
+                std::size_t body_off = soh9 + 1;
+                // fixpp#426: search BACKWARDS. CheckSum is the last field of a
+                // Framer-validated frame, while a Data value in the body may hold
+                // `<SOH>10=`, which a forward search would take for the trailer.
+                std::size_t p10 = s.rfind(
+                    "\x01"
+                    "10=");
+                if (p10 == std::string_view::npos || p10 + 1 < body_off)
+                    return std::nullopt;  // LCOV_EXCL_LINE — valid inbound view always has 10=
+                std::size_t body_len = (p10 + 1) - body_off;
+                return fixpp::wire::frame_view_access::make(buf, len, body_off, body_len);
+            };
 
-        auto maybe_fv = mk_fv(owned_frame.get(), frame_len);
+            auto maybe_fv = mk_fv(owned_frame.get(), frame_len);
 
-        // Allocate the clone shell first so we can seed its per-clone arena
-        // BEFORE building the MessageView.  The arena (arena_buf_ / arena_resource_)
-        // backs the clone's OffsetTable PMR vectors AND any group cursor shells
-        // allocated via fixpp_msg_get_group on the clone.  Seeded to frame_len +
-        // 4096 bytes: OffsetTable entries are proportional to the frame size; the
-        // extra 4096 gives headroom for group_slices + cursor shells.  Upstream =
-        // new_delete (graceful degrade if arena is exhausted, never null).
-        // Destruction order: fixpp_msg_destroy resets owned_view_ BEFORE
-        // arena_resource_, so MessageView destructs into a live arena.
-        auto clone = std::make_unique<fixpp_msg>();
-        constexpr std::size_t kCursorHeadroom = 4096;
-        std::size_t clone_arena_size = frame_len + kCursorHeadroom;
-        clone->arena_buf_ = std::make_unique<std::byte[]>(clone_arena_size);
-        clone->arena_resource_ = std::make_unique<std::pmr::monotonic_buffer_resource>(
-            clone->arena_buf_.get(), clone_arena_size, std::pmr::new_delete_resource());
-        auto* clone_mr = clone->arena_resource_.get();
+            // Allocate the clone shell first so we can seed its per-clone arena
+            // BEFORE building the MessageView.  The arena (arena_buf_ / arena_resource_)
+            // backs the clone's OffsetTable PMR vectors AND any group cursor shells
+            // allocated via fixpp_msg_get_group on the clone.  Seeded to frame_len +
+            // 4096 bytes: OffsetTable entries are proportional to the frame size; the
+            // extra 4096 gives headroom for group_slices + cursor shells.  Upstream =
+            // new_delete (graceful degrade if arena is exhausted, never null).
+            // Destruction order: fixpp_msg_destroy resets owned_view_ BEFORE
+            // arena_resource_, so MessageView destructs into a live arena.
+            auto clone = std::make_unique<fixpp_msg>();
+            constexpr std::size_t kCursorHeadroom = 4096;
+            std::size_t clone_arena_size = frame_len + kCursorHeadroom;
+            clone->arena_buf_ = std::make_unique<std::byte[]>(clone_arena_size);
+            clone->arena_resource_ = std::make_unique<std::pmr::monotonic_buffer_resource>(
+                clone->arena_buf_.get(), clone_arena_size, std::pmr::new_delete_resource());
+            auto* clone_mr = clone->arena_resource_.get();
 
-        // Build the clone's MessageView<Index> over the cloned bytes.
-        //
-        // 066-dict-backed-inbound-parse T007 (mechanism (b), FR-007/C4):
-        // propagate the source view's dictionary membership into a clone-owned
-        // table_view so the clone reads groups membership-bounded identically
-        // to its source. Bind dict-backed ONLY when the source itself is
-        // dict-backed (is_dict_backed()) — else stay dict-free (data-model.md
-        // degenerate case; binding a non-null-but-empty dict would instead flip
-        // OffsetTable::group() to a fail-closed empty-membership walk).
-        //
-        // 220: the clause that used to end that sentence — "NOT the dict-free
-        // positional fallback the source actually used" — is deleted, not
-        // reworded, because there is no longer a positional fallback to
-        // contrast with. A dict-free source does not read groups positionally;
-        // group() declines outright, so `fixpp_msg_get_group` reports
-        // TYPE_MISMATCH (B-220-1). The conditional itself is UNCHANGED and
-        // still correct, for the reasons that do not concern groups (field
-        // classification, unknown_fields), and clone/source fidelity is
-        // preserved in the stronger sense that both now decline identically
-        // rather than both guessing identically.
-        fixpp::wire::frame_view fv = maybe_fv.value_or(
-            fixpp::wire::frame_view_access::make(owned_frame.get(), frame_len, 0, frame_len));
-        std::unique_ptr<fixpp::wire::MessageView<fixpp::wire::access_mode::Index>> clone_view;
-        if (h->view->is_dict_backed()) {
-            clone->owned_tv_ = h->view->membership_copy();
-            fixpp::wire::Parser<fixpp::wire::access_mode::Index> clone_parser{*clone->owned_tv_};
-            auto parsed = clone_parser.parse(fv, clone_mr);
-            if (parsed) {
+            // Build the clone's MessageView<Index> over the cloned bytes.
+            //
+            // 066-dict-backed-inbound-parse T007 (mechanism (b), FR-007/C4):
+            // propagate the source view's dictionary membership into a clone-owned
+            // table_view so the clone reads groups membership-bounded identically
+            // to its source. Bind dict-backed ONLY when the source itself is
+            // dict-backed (is_dict_backed()) — else stay dict-free (data-model.md
+            // degenerate case; binding a non-null-but-empty dict would instead flip
+            // OffsetTable::group() to a fail-closed empty-membership walk).
+            //
+            // 220: the clause that used to end that sentence — "NOT the dict-free
+            // positional fallback the source actually used" — is deleted, not
+            // reworded, because there is no longer a positional fallback to
+            // contrast with. A dict-free source does not read groups positionally;
+            // group() declines outright, so `fixpp_msg_get_group` reports
+            // TYPE_MISMATCH (B-220-1). The conditional itself is UNCHANGED and
+            // still correct, for the reasons that do not concern groups (field
+            // classification, unknown_fields), and clone/source fidelity is
+            // preserved in the stronger sense that both now decline identically
+            // rather than both guessing identically.
+            fixpp::wire::frame_view fv = maybe_fv.value_or(
+                fixpp::wire::frame_view_access::make(owned_frame.get(), frame_len, 0, frame_len));
+            std::unique_ptr<fixpp::wire::MessageView<fixpp::wire::access_mode::Index>> clone_view;
+            if (h->view->is_dict_backed()) {
+                // fixpp#495 (`.specify/495-493-486-dict-reify-copy.md` §2.4): an
+                // owned-route source shares its table; a borrowed one is copied.
+                // The re-parse runs on the OWNED route over the heap shell's own
+                // member, so a clone of this clone shares too.
+                clone->owned_tv_ =
+                    fixpp::wire::detail::message_view_membership_access::shared_membership(
+                        *h->view);
+                fixpp::wire::Parser<fixpp::wire::access_mode::Index> clone_parser{
+                    fixpp::wire::detail::owned_route_key{}, clone->owned_tv_};
+                // fixpp#493 (`.specify/495-493-486-dict-reify-copy.md` §4): re-parse
+                // under the SOURCE's caps, so a raised or lowered cap survives the clone.
+                auto parsed = clone_parser.parse(fv, clone_mr, h->view->offsets().config());
+                if (parsed) {
+                    clone_view =
+                        std::make_unique<fixpp::wire::MessageView<fixpp::wire::access_mode::Index>>(
+                            std::move(*parsed));
+                } else {
+                    // fixpp#458 (090-capi-refusals) D-3: a dict-backed source whose
+                    // re-parse of the copied frame fails now REFUSES instead of
+                    // silently falling through to a dictionary-free clone (the
+                    // fail-open defect this comment used to document — see
+                    // contracts/msg-clone.md §1/§4.1). The code is translate()'s
+                    // own image of the core::error the failed re-parse produced
+                    // (FR-006) -- a condition plus a function, not a list: read
+                    // translate()'s switch for the codes a re-parse failure can
+                    // map to today (the out-of-memory route's code is L-049-2's
+                    // documented behaviour). `*clone_out` stays NULL (set unconditionally at
+                    // function entry); `clone` (the partially-built shell + its
+                    // arena) unwinds via RAII on this return; `src` is untouched
+                    // -- nothing beyond the initial byte copy was read from it.
+                    return fixpp_capi::detail::translate(parsed.error());
+                }
+            } else {
+                // Dict-free source: no dict-backed attempt is made, so nothing can
+                // fail here — the dict-free constructor never refuses; a failed build
+                // degrades in place. fixpp#493: it takes the source's caps too, through
+                // the four-argument form with `dict_hooks::none()`, which also seeds
+                // the root group context.
                 clone_view =
                     std::make_unique<fixpp::wire::MessageView<fixpp::wire::access_mode::Index>>(
-                        std::move(*parsed));
+                        fv, clone_mr, h->view->offsets().config(), fixpp::wire::dict_hooks::none());
             }
-        }
-        if (!clone_view) {
-            // Dict-free source, OR (practically unreachable — the same bytes the
-            // source already parsed successfully) the dict-backed re-parse
-            // failed: fall back to the dict-free 2-arg ctor (pre-066 behavior).
-            clone_view =
-                std::make_unique<fixpp::wire::MessageView<fixpp::wire::access_mode::Index>>(
-                    fv, clone_mr);
-        }
 
-        clone->tag_ = FIXPP_HANDLE_TAG_MSG;
-        clone->flavour = FixppMsgFlavour::inbound;  // reads via view (get_* API)
-        clone->view = clone_view.get();             // points to the owned view
-        clone->accumulator = nullptr;
-        // token is default-constructed (expired) — clone is session-independent (D-9).
-        // dict_ is nullptr for clone (no outbound mutation path).
-        clone->owned_frame_ = std::move(owned_frame);
-        clone->owned_view_ = std::move(clone_view);
+            clone->tag_ = FIXPP_HANDLE_TAG_MSG;
+            clone->flavour = FixppMsgFlavour::inbound;  // reads via view (get_* API)
+            clone->view = clone_view.get();             // points to the owned view
+            clone->accumulator = nullptr;
+            // token is default-constructed (expired) — clone is session-independent (D-9).
+            // dict_ is nullptr for clone (no outbound mutation path).
+            clone->owned_frame_ = std::move(owned_frame);
+            clone->owned_view_ = std::move(clone_view);
 
-        *clone_out = reinterpret_cast<fixpp_msg_t*>(clone.release());
-        return FIXPP_ERR_OK;
-    } catch (...) {  // LCOV_EXCL_LINE — OOM during clone construction; untestable in unit tests
-        return FIXPP_ERR_CAPI_CONFIG_INVALID;  // LCOV_EXCL_LINE
-    }  // LCOV_EXCL_LINE
+            *clone_out = reinterpret_cast<fixpp_msg_t*>(clone.release());
+            return FIXPP_ERR_OK;
+        } catch (std::bad_alloc const&) {
+            return FIXPP_ERR_CAPI_CONFIG_INVALID;
+        }
+    } catch (...) {
+        std::fputs(
+            "fixpp C-ABI: fixpp_msg_clone caught an escaping exception; "
+            "aborting (steady-state invariant violation, FR-008)\n",
+            stderr);
+        std::abort();
+    }
 }
 
 // ── fixpp_msg_set_string ──────────────────────────────────────────────────────
@@ -505,6 +613,10 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_string(fixpp_msg_t* msg, uint16_t t
     auto* h = reinterpret_cast<fixpp_msg*>(msg);
     // Dict validation (framing tag + DICT_CONFIG). String setter: always OK on any dict type.
     if (fixpp_error_t c = check_dict(h, tag, SetterFlavour::String); c != FIXPP_ERR_OK) return c;
+    // fixpp#428 §5.1: SOH only inside a Data value.
+    if (soh_outside_data(pair_hooks(h), tag, reinterpret_cast<const std::byte*>(value), len)) {
+        return FIXPP_ERR_WIRE_CONFORMANCE;
+    }
 
     // Steady-state thunk: abort on exception escape ([2i §5.2]).
     auto& acc = *h->accumulator;
@@ -532,6 +644,37 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_bytes(fixpp_msg_t* msg, uint16_t ta
     const auto* bdata = reinterpret_cast<const std::byte*>(bytes);
     entry.value_bytes.assign(bdata, bdata + len);
     return FIXPP_ERR_OK;
+}
+
+// ── fixpp_msg_set_data (fixpp#428, C-ABI 1.6) ──────────────────────────────────
+FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_data(fixpp_msg_t* msg, uint16_t data_tag,
+                                                  const uint8_t* bytes, size_t len) {
+    if (msg == nullptr || bytes == nullptr) return FIXPP_ERR_NULL_HANDLE;
+    if (fixpp_error_t c = check_outbound_msg(msg); c != FIXPP_ERR_OK) return c;
+
+    auto* h = reinterpret_cast<fixpp_msg*>(msg);
+    if (is_framing_tag(data_tag)) return FIXPP_ERR_MSG_FRAMING_TAG_FORBIDDEN;
+    const uint16_t length_tag = pair_hooks(h).length_tag_for_data(data_tag);
+    if (length_tag == 0) return FIXPP_ERR_TYPE_MISMATCH;
+    // The Length half comes from a dictionary pair, and a dictionary can pair a framing tag.
+    if (is_framing_tag(length_tag)) return FIXPP_ERR_MSG_FRAMING_TAG_FORBIDDEN;
+    if (len == 0) return FIXPP_ERR_WIRE_CONFORMANCE;  // an empty Data value is malformed
+
+    auto& acc = *h->accumulator;
+    if (is_group_collision(h, acc.entries, length_tag) ||
+        is_group_collision(h, acc.entries, data_tag)) {
+        return FIXPP_ERR_TYPE_MISMATCH;
+    }
+    if (h->dict_) {
+        for (const uint16_t t : {length_tag, data_tag}) {
+            if (h->dict_->field_ref(acc.msg_type, t).rule ==
+                fixpp::dict::field_presence::NotDeclared) {
+                return FIXPP_ERR_DICT_CONFIG;
+            }
+        }
+    }
+    return upsert_pair(acc.entries, acc.arena_, length_tag, data_tag,
+                       reinterpret_cast<const std::byte*>(bytes), len);
 }
 
 // ── fixpp_msg_set_int ─────────────────────────────────────────────────────────
@@ -678,17 +821,59 @@ static bool serialise_entries(std::byte* buf, std::size_t cap, std::size_t& pos,
 
 // Re-resolve a builder's group AccumulatorEntry BY INDEX (stable under the
 // vector reallocations that add_entry / group_begin trigger).
+//
+// D-2b (090 bundle, contracts/msg-index-bounds.md EC-2): returns nullptr when
+// `group_field_index`, or an ancestor's `instance_index`, is out of range for
+// the container it names, instead of subscripting past it. Every caller MUST
+// check for nullptr before dereferencing (msg-index-bounds.md §2.1 class (3)).
 static AccumulatorEntry* resolve_group(fixpp_group_builder* b) noexcept {
     if (b->parent == nullptr) {
-        return &b->msg->accumulator->entries[b->group_field_index];
+        auto& entries = b->msg->accumulator->entries;
+        if (b->group_field_index >= entries.size()) return nullptr;
+        return &entries[b->group_field_index];
     }
     AccumulatorEntry* pg = resolve_group(b->parent->builder);
+    if (pg == nullptr) return nullptr;  // class (3): propagate rather than dereference
+    // [const §IX.1] assessed: reachable only via a corrupted/stale builder — no
+    // shipped call path produces one once D-1 (fixpp#447) refuses remove_tag
+    // while a builder is open (msg-index-bounds.md §1).
+    if (b->parent->instance_index >= pg->instances.size()) return nullptr;
     GroupInstance& inst = pg->instances[b->parent->instance_index];
+    // [const §IX.1] assessed: same reasoning as above.
+    if (b->group_field_index >= inst.fields.size()) return nullptr;
     return &inst.fields[b->group_field_index];
+}
+
+// The context commit resolves `b`'s group under (validate_group_grammar): the message's
+// MsgType and the tags of the groups enclosing it, outermost first. Returns false when
+// an ancestor's group does not resolve: the failure propagates (D-2b class (3)) rather
+// than yielding a context silently missing a level. An out-parameter, not
+// std::optional: this sits inside the file's extern "C" block, where MSVC rejects a
+// function returning a C++ class template (C2526).
+static bool builder_context(fixpp_group_builder* b, fixpp::wire::group_context& out) noexcept {
+    if (b->parent == nullptr) {
+        out = fixpp::wire::group_context{.msg_type = b->msg->accumulator->msg_type};
+        return true;
+    }
+    fixpp::wire::group_context parent_ctx{};
+    if (!builder_context(b->parent->builder, parent_ctx)) return false;
+    AccumulatorEntry* pg = resolve_group(b->parent->builder);
+    // [const §IX.1] assessed unreachable: this function's only caller
+    // (fixpp_entry_set_data) already refuses on a null `resolve_group(e->builder)`
+    // before calling here, and that call recurses through the identical
+    // ancestor chain this one does (msg-index-bounds.md §2.1 class (3)); kept
+    // as defence in depth against a future caller that does not check first.
+    if (pg == nullptr) return false;
+    out = parent_ctx.pushed(pg->tag);
+    return true;
 }
 
 static GroupInstance* resolve_instance(fixpp_entry* e) noexcept {
     AccumulatorEntry* g = resolve_group(e->builder);
+    if (g == nullptr) return nullptr;  // class (3): propagate rather than dereference
+    // [const §IX.1] assessed: reachable only via a corrupted/stale entry — no
+    // shipped call path produces one once D-1 lands.
+    if (e->instance_index >= g->instances.size()) return nullptr;
     return &g->instances[e->instance_index];
 }
 
@@ -710,6 +895,15 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_remove_tag(fixpp_msg_t* msg, uint16_t t
     if (fixpp_error_t c = check_outbound_msg(msg); c != FIXPP_ERR_OK) return c;
 
     auto* h = reinterpret_cast<fixpp_msg*>(msg);
+    // D-1 (fixpp#447, contracts/msg-remove-tag.md §2): a live open group builder
+    // holds an INDEX into `entries` (or a parent instance's fields); erasing
+    // shifts every later index and can retarget or invalidate it. Keyed on the
+    // builder stack being non-empty — not on the erased tag and not on the
+    // erased position — because a narrower guard misses one of the two
+    // failure modes (see the contract). Runs BEFORE the find below: it does
+    // not matter whether `tag` is even present.
+    if (!h->accumulator->open_builders.empty()) return FIXPP_ERR_INVALID_HANDLE;
+
     auto& entries = h->accumulator->entries;
     // Erase the entry with `tag` if present (idempotent: absent → no-op).
     auto it =
@@ -845,6 +1039,39 @@ static fixpp_error_t validate_group_grammar(const std::pmr::vector<AccumulatorEn
     return FIXPP_ERR_OK;
 }
 
+// ── Length+Data conformance (fixpp#428 §5.3) ──────────────────────────────────
+//
+// Refuses a container, at any depth, whose Length+Data pairs are malformed or which
+// carries SOH outside a Data value, whichever setter wrote the fields. A group's
+// count field is one field of its container, so a Length right before a group is
+// a Length not followed by its Data; each instance is checked as its own container.
+static fixpp_error_t check_length_data(const std::pmr::vector<AccumulatorEntry>& fields,
+                                       const fixpp::wire::dict_hooks& hooks) noexcept {
+    fixpp::wire::length_data_checker checker{hooks};
+    for (const auto& e : fields) {
+        if (e.is_group) {
+            char cb[16];
+            const auto* ce = std::to_chars(cb, cb + sizeof(cb), e.instances.size()).ptr;
+            if (!checker.observe(e.tag, {reinterpret_cast<const std::byte*>(cb),
+                                         static_cast<std::size_t>(ce - cb)})) {
+                return FIXPP_ERR_WIRE_CONFORMANCE;
+            }
+            for (const auto& inst : e.instances) {
+                if (fixpp_error_t const c = check_length_data(inst.fields, hooks);
+                    c != FIXPP_ERR_OK) {
+                    return c;
+                }
+            }
+            continue;
+        }
+        if (soh_outside_data(hooks, e.tag, e.value_bytes.data(), e.value_bytes.size()) ||
+            !checker.observe(e.tag, e.value_bytes)) {
+            return FIXPP_ERR_WIRE_CONFORMANCE;
+        }
+    }
+    return checker.finish() ? FIXPP_ERR_OK : FIXPP_ERR_WIRE_CONFORMANCE;
+}
+
 // ── fixpp_msg_commit ──────────────────────────────────────────────────────────
 //
 // Serialise the accumulator into an app-payload in the session arena.
@@ -879,6 +1106,11 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_commit(fixpp_msg_t* msg, const uint8_t*
             validate_group_grammar(acc.entries, h->dict_.get(), h->session_tv_.get(),
                                    fixpp::wire::group_context{.msg_type = acc.msg_type});
         c != FIXPP_ERR_OK) {
+        return c;
+    }
+
+    // fixpp#428 §5.3: malformed Length+Data pairs, or SOH outside a Data value.
+    if (fixpp_error_t c = check_length_data(acc.entries, pair_hooks(h)); c != FIXPP_ERR_OK) {
         return c;
     }
 
@@ -964,6 +1196,10 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_group_builder_add_entry(fixpp_group_builder
 
     auto* arena = b->msg->accumulator->arena_;
     AccumulatorEntry* g = resolve_group(b);
+    // [const §IX.1] assessed: `b` is a live, open, LIFO-valid builder
+    // (check_builder above) — g resolves by construction; kept as defence in
+    // depth (msg-index-bounds.md §2.1 class (3)).
+    if (g == nullptr) return FIXPP_ERR_INVALID_HANDLE;
     g->instances.emplace_back(arena);
     auto inst_idx = static_cast<std::uint32_t>(g->instances.size() - 1);
 
@@ -992,6 +1228,9 @@ static fixpp_error_t entry_set_bytes_impl(fixpp_entry_t* entry, uint16_t tag, co
     if (is_framing_tag(tag)) return FIXPP_ERR_MSG_FRAMING_TAG_FORBIDDEN;
     auto* arena = e->builder->msg->accumulator->arena_;
     GroupInstance* inst = resolve_instance(e);
+    // [const §IX.1] assessed: same reasoning as fixpp_group_builder_add_entry
+    // (msg-index-bounds.md §2.1 class (3)).
+    if (inst == nullptr) return FIXPP_ERR_INVALID_HANDLE;
     // P2-1: a nested entry setter must not collide with a (nested) group either —
     // group-count tag, or clobbering an existing nested group node.
     if (is_group_collision(e->builder->msg, inst->fields, tag)) return FIXPP_ERR_TYPE_MISMATCH;
@@ -1004,7 +1243,63 @@ static fixpp_error_t entry_set_bytes_impl(fixpp_entry_t* entry, uint16_t tag, co
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_string(fixpp_entry_t* entry, uint16_t tag,
                                                       const char* value, size_t len) {
     if (value == nullptr) return FIXPP_ERR_NULL_HANDLE;
-    return entry_set_bytes_impl(entry, tag, reinterpret_cast<const std::byte*>(value), len);
+    if (fixpp_error_t c = precheck_entry_tag(entry, tag); c != FIXPP_ERR_OK) return c;
+    const auto* bytes = reinterpret_cast<const std::byte*>(value);
+    // fixpp#428 §5.1: SOH only inside a Data value (checked before delegation, so the
+    // shared entry_set_bytes_impl keeps serving the numeric setters unchanged).
+    if (soh_outside_data(pair_hooks(reinterpret_cast<fixpp_entry*>(entry)->builder->msg), tag,
+                         bytes, len)) {
+        return FIXPP_ERR_WIRE_CONFORMANCE;
+    }
+    return entry_set_bytes_impl(entry, tag, bytes, len);
+}
+
+// ── fixpp_entry_set_data (fixpp#428, C-ABI 1.6) ────────────────────────────────
+// Like fixpp_msg_set_data, on the current group instance. Like every entry setter it
+// runs no MsgType-grammar check.
+FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_data(fixpp_entry_t* entry, uint16_t data_tag,
+                                                    const uint8_t* bytes, size_t len) {
+    if (bytes == nullptr) return FIXPP_ERR_NULL_HANDLE;
+    if (fixpp_error_t c = precheck_entry_tag(entry, data_tag); c != FIXPP_ERR_OK) return c;
+
+    auto* e = reinterpret_cast<fixpp_entry*>(entry);
+    auto* h = e->builder->msg;
+    const uint16_t length_tag = pair_hooks(h).length_tag_for_data(data_tag);
+    if (length_tag == 0) return FIXPP_ERR_TYPE_MISMATCH;
+    // As in fixpp_msg_set_data: the derived Length half can be a framing tag.
+    if (is_framing_tag(length_tag)) return FIXPP_ERR_MSG_FRAMING_TAG_FORBIDDEN;
+    if (len == 0) return FIXPP_ERR_WIRE_CONFORMANCE;  // an empty Data value is malformed
+
+    AccumulatorEntry* group = resolve_group(e->builder);
+    // D-2b (msg-index-bounds.md EC-2, class (3)): a corrupted/stale ancestor
+    // builder resolves to nullptr here — checked before any further use of
+    // `group` (including builder_context below, which recurses through the
+    // identical ancestor chain and would otherwise be the first to dereference
+    // it). [const §IX.1] assessed: no shipped call path produces one.
+    if (group == nullptr) return FIXPP_ERR_INVALID_HANDLE;
+    // A Data field cannot be a group's delimiter: its Length would have to come first.
+    // The delimiter is the one for this group's exact context, as commit resolves it; a
+    // group tag reused elsewhere can open with a different field. On a context miss
+    // the setter defers to commit, which fails closed.
+    if (h->dict_ && h->session_tv_) {
+        fixpp::wire::group_context ctx{};
+        // unreachable: `group` resolved above, through the same ancestor chain
+        if (!builder_context(e->builder, ctx)) return FIXPP_ERR_INVALID_HANDLE;
+        const auto delimiter = h->session_tv_->group_first_field_exact(
+            ctx.msg_type, {ctx.parent_path.data(), ctx.depth}, group->tag);
+        if (delimiter && *delimiter == data_tag) return FIXPP_ERR_TYPE_MISMATCH;
+    }
+    // D-2b (msg-index-bounds.md EC-2, class (2)): the direct subscript below is
+    // reached by no resolver ("no resolver covers it" per the contract), so it
+    // needs its own bounds check.
+    if (e->instance_index >= group->instances.size()) return FIXPP_ERR_INVALID_HANDLE;
+    GroupInstance& inst = group->instances[e->instance_index];
+    if (is_group_collision(h, inst.fields, length_tag) ||
+        is_group_collision(h, inst.fields, data_tag)) {
+        return FIXPP_ERR_TYPE_MISMATCH;
+    }
+    return upsert_pair(inst.fields, h->accumulator->arena_, length_tag, data_tag,
+                       reinterpret_cast<const std::byte*>(bytes), len);
 }
 
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_int(fixpp_entry_t* entry, uint16_t tag,
@@ -1051,6 +1346,9 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_entry_group_begin(fixpp_entry_t* entry, uin
 
     auto* arena = h->accumulator->arena_;
     GroupInstance* inst = resolve_instance(e);
+    // [const §IX.1] assessed: same reasoning as entry_set_bytes_impl
+    // (msg-index-bounds.md §2.1 class (3)).
+    if (inst == nullptr) return FIXPP_ERR_INVALID_HANDLE;
     inst->fields.emplace_back(arena);
     auto idx = static_cast<std::uint32_t>(inst->fields.size() - 1);
     inst->fields.back().tag = group_tag;

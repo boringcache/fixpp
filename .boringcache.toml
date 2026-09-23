@@ -6,12 +6,12 @@ metadata-hints = ["project=fixpp", "experiment=issue-411-tier1"]
 [entries.wheel-ccache]
 path_env = "CCACHE_DIR"
 default_path = "/tmp/fixpp-ccache-wheel"
-tag = "fixpp-tier1-wheel-ccache-rolling-v2-20260916"
+tag = "fixpp-tier1-wheel-ccache-rolling-v3-20260923"
 
 [profiles.wheel-ccache]
 entries = ["wheel-ccache"]
 
 [adapters.ccache]
-tag = "fixpp-tier1-ccache-rolling-v2-20260916"
+tag = "fixpp-tier1-ccache-rolling-v3-20260923"
 no-git = true
 metadata-hints = ["tool=ccache", "workflow=tier1"]

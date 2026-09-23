@@ -6,6 +6,56 @@ status: stable
 
 # Log
 
+- **2026-09-23 — B13 (#495 / #493 / #486), a shared reify table, copies that keep their caps.**
+  `components/dictionary.md`'s eager-reify section gains the owned route: a reify of a
+  `Session`-dispatched view shares the table by reference count and pins the table only, never the
+  `Dictionary`; the impl comes from `mr`. What was rejected: a public owned route, a `shared_ptr` by
+  value on every view, the owner token inside `dict_hooks`. 215's alias design is flagged
+  superseded in part. `components/c-api.md` gains the C-ABI 1.8 loader entry (D-5) and a
+  superseded-in-part note on the clone refusal it described. `L-458-2` is resolved. Authority:
+  `.specify/495-493-486-dict-reify-copy.md`.
+  - **Gate B (PR #502)** adds two owner-approved instances to `failure-classes.md`:
+    - class 1: a phrase grep over comments cannot see a phrase that wraps onto the next comment line;
+    - class 10: a member added to a class template costs every instantiation (`MessageView<Iter>`).
+
+- **2026-09-22: fixpp#490 Gate B (PR #496).** `failure-classes.md` gains two owner-approved forms:
+  - class 1: an oracle's error routed into the "not applicable" branch fails open in a gate;
+  - a NEW **class 17** (*trust keyed on a textual proxy admits whatever shares the proxy*): basename
+    identity, and path text taken as existence.
+
+  The same forms are entries in the Sonnet implementer's anti-pattern library.
+
+- **2026-09-22: 090 Gate B (PR #494).** `components/dictionary.md`'s eager-reify section gains three things:
+  - what eager costs;
+  - that the pre-existing reify benchmark returned before the path it was named for;
+  - why a layout-only regression past +5% was not "fixed" by forcing alignment.
+
+  `failure-classes.md` gains two owner-approved forms. Class 1 gains the benchmark that never runs the path it is cited for. Class 3 gains provenance ("unedited", "kept green"), a result about a diff that is still growing. The same two are entries in the Sonnet implementer's anti-pattern library. Follow-up fixpp#495 covers the dict-backed reify cost.
+
+  Gate B changed no production code across four rounds. Every finding was a test or benchmark gap, or prose claiming more than the code delivers, and twice a fix wrote the next false claim: a replacement list, and an "unedited" provenance note that its own round falsified.
+
+- **2026-09-22 — 090 (#447 / #458 / #452), three C-ABI refusals and a producer set the code never had.**
+  `components/c-api.md` gains a *C-ABI 1.7* section on the three BREAKING refusals and what each
+  one rejected: re-indexing open builders, minting a new code for clone, `FIXPP_ERR_DICT_OOM`, and
+  amending `[2i §5.2]`'s whitelist. The index-bounds work is defence in depth and is **not**
+  BREAKING. `components/dictionary.md` gains the reify factory's switch from lazy to eager, and why
+  eager was needed: a `noexcept` reference accessor has nowhere to put a refusal.
+  `components/wire.md` gains a pointer to `L-458-1`, a build that under-indexes and still succeeds.
+  `components/session.md` gains the configured-byte floor, one predicate on both surfaces, and the
+  point that it is **policy, not grammar**. `components/errors.md` gains a flag it should already
+  have had. `.specify/2i-capi.md` bound `FIXPP_ERR_CAPI_CONFIG_INVALID` to the construction thunks
+  (*"Used only by `guarded_call_construction`"*, *"CI grep enforces"*), and that was false against
+  the shipped tree before 090 touched anything. No brain page had flagged it. The bundle routed to
+  `2i` for this code without saying the doc was wrong there. 090 condition-stated it and its two
+  restatements (`api-contract.md` §7.5, `2m-pybind.md`); fixpp#488 closes on merge.
+  ⚠️ **Gate A did not converge (`gate-a-waived`)**, so read the gate record before citing a D-number
+  as reviewed. Class 1 gains **a positive control proves the command ran, not that the corpus holds
+  the answer**. A grep of the build files, with a correct different-pattern control, "proved"
+  libstdc++ hardening off, but `_GLIBCXX_ASSERTIONS` is a library default at `-O0`. ⚠️ Some expected
+  corrections had no antecedent here. `is_invalid_cred_byte` and a "lazy" reify view appeared
+  nowhere in `brain/` (grepped, with a control), and `components/config.md` covers TOML loading, not
+  `SessionConfig`. None of those was edited just to match the expectation.
+
 - **2026-09-14 — #413 / #416 / #417, the lint sweep and a `-Werror` that did nothing.**
   `components/nfr-and-tooling.md` gains *warnings as errors and the lint/format sweep*: why
   `FIXPP_WERROR` is applied by walking the buildsystem instead of by a call list (a call list is how it

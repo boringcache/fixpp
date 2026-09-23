@@ -49,12 +49,14 @@
 #include <vector>
 
 #include "support/context_group_delim_fn.hpp"  // 384: the production delimiter oracle
+#include "support/dict_hooks_test_access.hpp"  // fixpp#426: half-threaded dict_hooks bundles
 #include "support/frame_view_factory.hpp"
 #include "support/pmr_allocation_tracking_resource.hpp"
 
 namespace {
 
 using fixpp::dict::table_view;
+using fixpp::dict::table_view_builder;
 using fixpp::wire::access_mode;
 using fixpp::wire::dictionary_driven_validator;
 using fixpp::wire::group_slice;
@@ -93,15 +95,15 @@ std::vector<std::byte> make_frame(std::string_view body_fields) {
 // itself (contract C-4.1's "the tags [inside the nested group] are not
 // members of the outer group" framing).
 table_view make_bare_nested_delim_dict() {
-    table_view tv;
+    table_view_builder tvb;
     for (std::uint16_t const t :
          {std::uint16_t{8}, std::uint16_t{9}, std::uint16_t{10}, std::uint16_t{35},
           std::uint16_t{100}, std::uint16_t{200}, std::uint16_t{201}}) {
-        tv.add_valid("X", t);
+        tvb.add_valid("X", t);
     }
-    tv.set_group_first(100, 200);  // NoOuter: delimiter = NoInner's own count tag
-    tv.set_group_first(200, 201);  // NoInner: delimiter = InnerField
-    return tv;
+    tvb.set_group_first(100, 200);  // NoOuter: delimiter = NoInner's own count tag
+    tvb.set_group_first(200, 201);  // NoInner: delimiter = InnerField
+    return std::move(tvb).build();
 }
 
 // ── T020 (W-10a legs 2/3): the SAME shape on a POPULATED context store ──────
@@ -530,7 +532,7 @@ TEST(TypedReadSplitAgreement, ExtentWalkDescendsAtNestedGroupDelimiter_Populated
 //
 // ── The discriminator: a `group_member_fn_` invocation count ────────────────
 // Supplied through the EXISTING construction-time `group_member_fn_t` seam
-// (`OffsetTable::group_member_fn_t`) — a plain function pointer, so no
+// (`dict_hooks::group_member_fn_t`) — a plain function pointer, so no
 // production change and no new seam.
 //
 // The arithmetic, derived in the frame whose descent hits the cap (the frame
@@ -570,19 +572,19 @@ constexpr std::size_t kChainGroups = 17;
 constexpr std::size_t kCapHittingIndex = 15;
 
 table_view make_chain_dict() {
-    table_view tv;
+    table_view_builder b;
     for (std::uint16_t const t :
          {std::uint16_t{8}, std::uint16_t{9}, std::uint16_t{10}, std::uint16_t{35}}) {
-        tv.add_valid("Z", t);
+        b.add_valid("Z", t);
     }
     for (std::size_t i = 0; i <= kChainGroups; ++i) {
-        tv.add_valid("Z", static_cast<std::uint16_t>(kChainBase + i));
+        b.add_valid("Z", static_cast<std::uint16_t>(kChainBase + i));
     }
     for (std::size_t i = 0; i < kChainGroups; ++i) {
-        tv.set_group_first(static_cast<std::uint16_t>(kChainBase + i),
-                           static_cast<std::uint16_t>(kChainBase + i + 1));
+        b.set_group_first(static_cast<std::uint16_t>(kChainBase + i),
+                          static_cast<std::uint16_t>(kChainBase + i + 1));
     }
-    return tv;
+    return std::move(b).build();
 }
 
 // One physical instance at every level. `deep_count` is written into the
@@ -637,12 +639,15 @@ ChainRun run_chain(table_view const& tv, std::vector<std::byte> const& buf,
         return out;
     }
     g_probe_calls = 0;
-    // 384: the delimiter oracle has no default any more, so name it. The chain
-    // fixture calls `set_group_first` at every level, so this is the
-    // production shape; it is also inert for this cell, which drives
+    // 384 / fixpp#426: the delimiter oracle has no default any more, so name
+    // it. The chain fixture calls `set_group_first` at every level, so this
+    // is the production shape; it is also inert for this cell, which drives
     // `group()` (the extent walk) and never reaches the splitter.
-    fixpp::wire::OffsetTable table{*fv, mr, &tv, &counting_group_member,
-                                   &fixpp_test_support::context_group_delim_fn};
+    fixpp::wire::OffsetTable table{
+        *fv, mr,
+        fixpp::wire::dict_hooks_test_access::make(&tv, /*classify=*/nullptr, &counting_group_member,
+                                                  &fixpp_test_support::context_group_delim_fn,
+                                                  /*length_pair=*/nullptr)};
     auto const gi = table.group(kChainBase);
     out.probe_calls = g_probe_calls;
     out.group_too_large = !gi.has_value() && gi.error() == fixpp::core::error::wire_group_too_large;
@@ -934,7 +939,11 @@ TEST(TypedReadSplitAgreement, OutOfScopeWireProbesUnchanged) {
     // ── PRE-083 oracle: same frame, same dict, same membership oracle, NO
     //    delimiter callback (C-8.4's dict-free fallback == the pre-083 rule) ──
     std::pmr::monotonic_buffer_resource oracle_arena;
-    fixpp::wire::OffsetTable pre{*fv, &oracle_arena, &tv, &divergent_member_fn, nullptr};
+    fixpp::wire::OffsetTable pre{
+        *fv, &oracle_arena,
+        fixpp::wire::dict_hooks_test_access::make(&tv, /*classify=*/nullptr, &divergent_member_fn,
+                                                  /*group_delim=*/nullptr,
+                                                  /*length_pair=*/nullptr)};
     ASSERT_TRUE(pre.build_status().has_value()) << "oracle table failed to build";
     // The ROOT context MessageView seeds unconditionally (its dict-aware ctor's `set_group_context`
     // call); reproduce it so the two tables differ in the delimiter callback ALONE.

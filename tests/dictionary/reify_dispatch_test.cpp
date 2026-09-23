@@ -50,6 +50,7 @@
 #include <fixpp/dict/reify.hpp>
 #include <fixpp/dict/version_profile.hpp>
 #include <fixpp/wire/message_view_contract.hpp>
+#include <memory>
 #include <memory_resource>
 #include <optional>
 #include <span>
@@ -58,7 +59,9 @@
 #include <utility>
 #include <vector>
 
+#include "support/copy_site_fixtures.hpp"    // fixpp#493: shared copy-site frames + comparisons
 #include "support/failing_pmr_resource.hpp"  // 057: view()-OOM degrade witness
+#include "support/fix44_dictionary.hpp"  // 090-capi-refusals US4: dict-backed source (T058/T059/T062)
 #include "support/msvc_debug_arena_skip.hpp"
 #include "support/reify_test_frame.hpp"  // 057: make_*_frame() helpers (E-6)
 
@@ -110,6 +113,25 @@ private:
     fixpp::wire::frame_view fvs_[1]{};
     std::optional<MV> mv_;
 };
+
+constexpr resolved_message_version kAppV44Rmv{.k = resolved_message_version::kind::application,
+                                              .session = session_version::v44,
+                                              .application = application_version::v44,
+                                              ._reserved = 0};
+
+// fixpp#495 D-1c (`.specify/495-493-486-dict-reify-copy.md` §2.5, §10 T-16): the
+// number of `mr` calls the reify factory makes BEFORE it copies the frame bytes —
+// the handle's impl. Derived at run time from an empty default view, on the
+// precondition (asserted by ImplIsTheFactorysFirstMrAllocation) that the
+// empty-view path uses `mr` only for the impl, so an OOM cell names the PHASE it
+// fails and never an ordinal.
+// Returns 0 if the probe itself fails, which every caller treats as a failure.
+[[nodiscard]] std::size_t impl_mr_calls() {
+    std::pmr::monotonic_buffer_resource upstream;
+    fixpp::test_support::failing_pmr_resource probe{&upstream, /*fail_on_call_n=*/0};
+    auto h = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, MV{}, &probe);
+    return h.has_value() ? probe.allocate_calls() : 0U;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compile-time shape: dispatch helpers exist and have correct signatures.
@@ -527,7 +549,7 @@ TEST(ReifyRoundTrip, HandleMoveAssignPreservesTargetAndResetsSource) {
     auto b = fixpp::dict::reify(fb.view(), kProfileV44, &mr);
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
-    (void)a->view();  // populate a's lazy view_cache_ so a non-trivial pimpl moves
+    (void)a->view();  // view_cache_ is already populated by reify() (fixpp#458 D-4); this read is kept only as the pre-D-4 shape
 
     *b = std::move(*a);
 
@@ -609,37 +631,73 @@ TEST(ReifyErrorContract, AbsentMsgTypeTag35) {
         << "FR-009: absent tag 35 must return dict_reify_unknown_msg_type";
 }
 
-TEST(ReifyErrorContract, DeepCopyOomYieldsReifyOom) {
-    // A memory_resource that cannot satisfy the byte deep-copy → dict_reify_oom.
-    // MSVC debug/asan STL allocates a hidden _Container_proxy per pmr container
-    // from this null-backed arena during a noexcept ctor → terminate, not a
-    // catchable bad_alloc. Behaviour is covered on msvc-release + all Linux lanes.
+// fixpp#495 T-16(a) probe: the handle's impl is the factory's FIRST `mr` call
+// (D-1c: allocated from `mr`, not the global heap). Mutation: revert D-1c — the
+// impl leaves `mr` and the count drops to 0.
+TEST(ReifyErrorContract, ImplIsTheFactorysFirstMrAllocation) {
+    // MSVC debug pmr containers draw hidden proxies from `mr` inside the impl's
+    // constructor, so the count differs there; every other lane runs this.
     FIXPP_SKIP_ON_MSVC_DEBUG_ARENA();
+    EXPECT_EQ(impl_mr_calls(), 1U)
+        << "the reify handle's impl must be the one allocation before the frame copy";
+}
+
+// fixpp#495 T-16 impl arm: failing the IMPL's allocation yields dict_reify_oom,
+// with no handle (and, under ASan, no leak).
+TEST(ReifyErrorContract, ImplOomYieldsReifyOom) {
+    FIXPP_SKIP_ON_MSVC_DEBUG_ARENA();
+    auto const impl_calls = impl_mr_calls();
+    ASSERT_GT(impl_calls, 0U) << "calibration: the impl must come from mr";
     ReifyFixture f{fixpp::test_support::make_nos_frame()};
     ASSERT_TRUE(f.ok());
-    std::pmr::monotonic_buffer_resource oom{std::pmr::null_memory_resource()};
+    std::pmr::monotonic_buffer_resource upstream;
+    fixpp::test_support::failing_pmr_resource fail{&upstream, /*fail_on_call_n=*/impl_calls};
+    auto r = fixpp::dict::reify(f.view(), kProfileV44, &fail);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error::dict_reify_oom);
+}
+
+TEST(ReifyErrorContract, DeepCopyOomYieldsReifyOom) {
+    // Phase: the frame-byte deep copy, the first `mr` call after the impl
+    // (impl_mr_calls() + 1) → dict_reify_oom. A cell that fails the FIRST `mr`
+    // call fails the impl (D-1c), not the deep copy, so it would not measure it.
+    // MSVC debug/asan STL allocates a hidden _Container_proxy per pmr container
+    // from `mr` during a noexcept ctor → terminate, not a catchable bad_alloc.
+    // Behaviour is covered on msvc-release + all Linux lanes.
+    FIXPP_SKIP_ON_MSVC_DEBUG_ARENA();
+    auto const impl_calls = impl_mr_calls();
+    ASSERT_GT(impl_calls, 0U) << "calibration: the impl must come from mr";
+    ReifyFixture f{fixpp::test_support::make_nos_frame()};
+    ASSERT_TRUE(f.ok());
+    std::pmr::monotonic_buffer_resource upstream;
+    fixpp::test_support::failing_pmr_resource oom{&upstream, /*fail_on_call_n=*/impl_calls + 1};
     auto r = fixpp::dict::reify(f.view(), kProfileV44, &oom);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), error::dict_reify_oom);
 }
 
 TEST(ReifyErrorContract, ViewRebuildOomDegradesNotTerminate) {
-    // 057 / 004-T059 hardening: the deep-copy (alloc #1) succeeds so reify()
-    // returns a live handle, but the LAZY view() OffsetTable build (alloc #2)
-    // then OOMs. owning_message_handle::view() is noexcept, so a throwing mr at
-    // first field access must NOT terminate — the OffsetTable ctor degrades to
-    // an empty table (out_of_memory) and field_value() reports field-absent.
+    // 057 / 004-T059 hardening: the impl and the frame-byte deep copy succeed so
+    // reify() returns a live handle, but the dict-free OffsetTable build — its
+    // first `mr` call, impl_mr_calls() + 2 (a complete frame never appends to the
+    // carry), which runs EAGERLY inside the factory (fixpp#458 D-4) — then
+    // OOMs. The factory is noexcept, so it must NOT terminate — the OffsetTable
+    // ctor degrades to an empty table (out_of_memory) and field_value() reports
+    // field-absent.
     FIXPP_SKIP_ON_MSVC_DEBUG_ARENA();
+    auto const impl_calls = impl_mr_calls();
+    ASSERT_GT(impl_calls, 0U) << "calibration: the impl must come from mr";
     ReifyFixture f{fixpp::test_support::make_nos_frame()};
     ASSERT_TRUE(f.ok());
     std::array<std::byte, 1024 * 64> buf{};
     std::pmr::monotonic_buffer_resource upstream{buf.data(), buf.size()};
-    fixpp::test_support::failing_pmr_resource fail{&upstream, /*fail_on_call_n=*/2};
+    fixpp::test_support::failing_pmr_resource fail{&upstream,
+                                                   /*fail_on_call_n=*/impl_calls + 2};
 
     auto r = fixpp::dict::reify(f.view(), kProfileV44, &fail);
-    ASSERT_TRUE(r.has_value()) << "deep-copy (alloc #1) must succeed → live handle";
-    // First field access triggers the lazy view() rebuild → OffsetTable alloc #2
-    // fails. Must degrade, not terminate.
+    ASSERT_TRUE(r.has_value()) << "the impl and the deep copy must succeed → live handle";
+    // The OffsetTable build already failed inside reify(); the handle is returned
+    // degraded, so the field read reports absent.
     auto clord = r->field_value(11);
     EXPECT_FALSE(clord.has_value())
         << "OOM during OffsetTable build → field-absent (graceful degrade)";
@@ -742,6 +800,244 @@ TEST(ReifyAsTyped, AbsentMsgTypeRejected) {
     auto r = fixpp::dict::reify_as<fixpp::v44::NewOrderSingle>(f.view(), &mr);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), error::dict_reify_msg_type_mismatch);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 090-capi-refusals US4 (T058-T063) — [C++ track]. The reify factory
+// (`fixpp::dict::detail::owning_message_handle_from_frame`) materialises its
+// view EAGERLY and refuses through its EXISTING core::expected_t channel on
+// EXACTLY ONE new condition: a failed dict-backed re-parse (D-4). Arms
+// (i-b) and (iv) — the dict-free OOM degrade and the frames-to-nothing span
+// — are SHIPPED ELSEWHERE (ViewRebuildOomDegradesNotTerminate above; the
+// default-constructed-MV cells throughout this file, vlatest_dispatch_
+// exclusion_test.cpp and fixt_cross_vocabulary.cpp)
+// and are not re-witnessed here (T060/T061).
+// fixpp#458 / contracts/msg-clone.md §9 / data-model.md §2.2, §3.3, EC-8.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A dict-backed source MessageView<Index> over a v44 NewOrderSingle
+// (make_nos_frame()) under the default caps, backed by the real FIX44 dictionary:
+// the shared copy-site fixture (tests/support/copy_site_fixtures.hpp) with this
+// frame. Callers ASSERT ok() first.
+class DictBackedNosFixture : public fixpp::test_support::copy_site_source {
+public:
+    DictBackedNosFixture()
+        : copy_site_source{fixpp::test_support::make_nos_frame(), {}, /*dict_backed=*/true} {}
+};
+
+// T059 arm (i-a): a dict-free source, healthy allocator — succeeds, not
+// dict-backed, OffsetTable build_status ok. Without this arm (and (i-b) and
+// (iv)), "refuse whenever anything goes wrong" would pass.
+TEST(ReifyEagerMaterialization, DictFreeHealthySourceSucceeds) {
+    ReifyFixture f{fixpp::test_support::make_nos_frame()};
+    ASSERT_TRUE(f.ok());
+    std::pmr::monotonic_buffer_resource mr;
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, f.view(), &mr);
+    ASSERT_TRUE(r.has_value())
+        << "V7 arm (i-a): a dict-free source with a healthy allocator must succeed";
+    EXPECT_FALSE(r->view().is_dict_backed());
+    EXPECT_TRUE(r->view().offsets().build_status().has_value());
+    auto clord = r->field_value(11);
+    ASSERT_TRUE(clord.has_value());
+    EXPECT_EQ(clord->as_string(), "ORD1");
+}
+
+// T059 arm (ii): a dict-backed source that parses cleanly — succeeds, the
+// view is dict-backed.
+TEST(ReifyEagerMaterialization, DictBackedCleanParseSucceeds) {
+    DictBackedNosFixture f;
+    ASSERT_TRUE(f.ok()) << "fixture precondition: v44 NewOrderSingle must dict-parse cleanly";
+    std::pmr::monotonic_buffer_resource mr;
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, f.view(), &mr);
+    ASSERT_TRUE(r.has_value())
+        << "V7 arm (ii): a dict-backed source whose re-parse succeeds must succeed";
+    EXPECT_TRUE(r->view().is_dict_backed());
+    auto clord = r->field_value(11);
+    ASSERT_TRUE(clord.has_value());
+    EXPECT_EQ(clord->as_string(), "ORD1");
+}
+
+// T058 — arm (iii), the ONLY new refusal this half adds, anywhere: a
+// dict-backed source whose re-parse of the copied frame fails. Calibrated by
+// INSTRUMENTING this build (never by copying an existing constant, per
+// T063/§8 item 11): a healthy warm-up run through a COUNTING
+// failing_pmr_resource (fail_on_call_n=0, never fails) establishes the total
+// allocation count through `mr` for a successful materialisation of this
+// exact source; injecting failure at that LAST call lands inside the eager
+// re-parse's OffsetTable build, never the impl or the bytes_ deep copy (the
+// first impl_mr_calls() + 1 calls; the deep copy is T062's spurious-hit boundary).
+TEST(ReifyEagerMaterialization, FailedDictBackedReparseRefuses) {
+    // Byte-exact failing-allocator injection: MSVC's debug STL draws a hidden
+    // _Container_proxy from the same resource, shifting the failing call into a
+    // container's initialisation, where bad_alloc escapes a noexcept path. Skipped
+    // there only; exercised on MSVC release and every Linux lane.
+    FIXPP_SKIP_ON_MSVC_DEBUG_ARENA();
+    DictBackedNosFixture f;
+    ASSERT_TRUE(f.ok()) << "fixture precondition: v44 NewOrderSingle must dict-parse cleanly";
+
+    std::pmr::monotonic_buffer_resource probe_upstream;
+    fixpp::test_support::failing_pmr_resource probe{&probe_upstream, /*fail_on_call_n=*/0};
+    auto warm = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, f.view(), &probe);
+    ASSERT_TRUE(warm.has_value()) << "calibration: an unfailing allocator must still succeed";
+    auto const total_calls = probe.allocate_calls();
+    ASSERT_GT(total_calls, impl_mr_calls() + 1U)
+        << "calibration sanity: the eager re-parse must allocate beyond the impl and the "
+           "bytes_ deep copy, or this cell cannot land inside it";
+
+    std::pmr::monotonic_buffer_resource fail_upstream;
+    fixpp::test_support::failing_pmr_resource fail{&fail_upstream, total_calls};
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, f.view(), &fail);
+
+    ASSERT_FALSE(r.has_value())
+        << "V7 arm (iii): a dict-backed source whose re-parse fails must refuse — no handle";
+    EXPECT_EQ(r.error(), fixpp::core::error::out_of_memory)
+        << "EC-8: the refusal must carry the wire error the failed parse produced (the "
+           "OffsetTable build's own out_of_memory degrade, propagated by Parser::parse), "
+           "NOT the pre-existing deep-copy sentinel (dict_reify_oom) and not a generic code";
+}
+
+// T062 — the mandatory spurious-hit control: a failing allocator can ALSO
+// fail the bytes_ deep copy (the first `mr` call after the impl), which returns the PRE-EXISTING
+// dict_reify_oom sentinel through the outer catch, an arm that already
+// worked before D-4. Without this control, FailedDictBackedReparseRefuses
+// measures the arm that was never broken.
+TEST(ReifyEagerMaterialization, SpuriousHitControl_DeepCopyOomStillYieldsDictReifyOom) {
+    // Same byte-exact injection as FailedDictBackedReparseRefuses: on MSVC's debug
+    // STL the first call on the resource is a hidden _Container_proxy, not bytes_.
+    FIXPP_SKIP_ON_MSVC_DEBUG_ARENA();
+    DictBackedNosFixture f;
+    ASSERT_TRUE(f.ok()) << "fixture precondition: v44 NewOrderSingle must dict-parse cleanly";
+
+    auto const impl_calls = impl_mr_calls();
+    ASSERT_GT(impl_calls, 0U) << "calibration: the impl must come from mr";
+    std::pmr::monotonic_buffer_resource fail_upstream;
+    fixpp::test_support::failing_pmr_resource fail{&fail_upstream,
+                                                   /*fail_on_call_n=*/impl_calls + 1};
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, f.view(), &fail);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), fixpp::core::error::dict_reify_oom)
+        << "control: failing the bytes_ deep copy must still yield the pre-existing "
+           "dict_reify_oom sentinel, not EC-8's re-parse refusal";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// fixpp#493 — the reify factory re-parses under its SOURCE's caps
+// (`.specify/495-493-486-dict-reify-copy.md` §4 / §10 T-2, T-4, T-5).
+// ═════════════════════════════════════════════════════════════════════════════
+
+using fixpp::test_support::copy_site_source;
+using fixpp::test_support::reads_sender_id;
+
+// T-2: a dict-backed source parsed under a RAISED entry cap reifies; the copy
+// carries the source's Config, reads the marker field, and keeps every entry.
+TEST(ReifyEagerMaterialization, RaisedCapDictBackedSourceReifiesUnderItsOwnCaps) {
+    copy_site_source src{fixpp::test_support::make_oversized_frame_for_clone_test(4100),
+                         {.max_offset_entries = 8192},
+                         /*dict_backed=*/true};
+    ASSERT_TRUE(src.ok()) << "precondition: the raised cap admits the source";
+    ASSERT_TRUE(src.view().is_dict_backed());
+
+    std::pmr::monotonic_buffer_resource mr;
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, src.view(), &mr);
+    ASSERT_TRUE(r.has_value()) << "the copy must re-parse under the source's raised cap";
+    EXPECT_TRUE(fixpp::test_support::same_config(r->view().offsets().config(),
+                                                 src.view().offsets().config()));
+    EXPECT_TRUE(reads_sender_id(r->view()));
+    EXPECT_EQ(r->view().offsets().entries().size(), src.view().offsets().entries().size());
+}
+
+// T-4 (C++ twin of MessageWrite.CloneDictFreeOversizedSourceStillReturnsOk): the
+// dict-free fallback re-parses under the source's Config (before, its default-cap
+// build failed and every read reported absent) and seeds the same root group
+// context as a Parser{}-parsed source.
+TEST(ReifyEagerMaterialization, RaisedCapDictFreeSourceReifiesReadable) {
+    copy_site_source src{fixpp::test_support::make_oversized_frame_for_clone_test(4100),
+                         {.max_offset_entries = 8192},
+                         /*dict_backed=*/false};
+    ASSERT_TRUE(src.ok());
+    ASSERT_FALSE(src.view().is_dict_backed());
+
+    std::pmr::monotonic_buffer_resource mr;
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, src.view(), &mr);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(r->view().is_dict_backed());
+    // Non-fatal, so the context assertion below runs even when the copy is empty.
+    EXPECT_TRUE(reads_sender_id(r->view())) << "the dict-free copy must be readable, not empty";
+    constexpr std::uint16_t kNoPartyIDs = 453;  // any count tag
+    EXPECT_TRUE(fixpp::test_support::same_group_context(
+        r->view().offsets().group_context_for(kNoPartyIDs),
+        src.view().offsets().group_context_for(kNoPartyIDs)));
+}
+
+// T-5(a): the whole Config travels. Both caps raised, one NoPartyIDs instance
+// longer than the default per-instance cap; the copy reads that group.
+TEST(ReifyEagerMaterialization, CopyKeepsRaisedGroupInstanceCap) {
+    copy_site_source src{fixpp::test_support::make_long_party_instance_frame(4200),
+                         {.max_offset_entries = 16384, .max_group_entries_per_instance = 8192},
+                         /*dict_backed=*/true};
+    ASSERT_TRUE(src.ok());
+    ASSERT_TRUE(src.view().offsets().group(453).has_value())
+        << "precondition: the source reads its long instance under its raised caps";
+
+    std::pmr::monotonic_buffer_resource mr;
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, src.view(), &mr);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->view().offsets().group(453).has_value())
+        << "the copy must keep the source's raised per-instance group cap";
+}
+
+// T-5(b): a LOWERED per-instance group cap travels too. The source reads its
+// scalars and fails its group read (the cap is lazy); the copy must do the same,
+// with the same error, where a default-cap re-parse would read the group.
+TEST(ReifyEagerMaterialization, CopyKeepsLoweredGroupInstanceCap) {
+    copy_site_source src{fixpp::test_support::make_long_party_instance_frame(1),
+                         {.max_group_entries_per_instance = 2},
+                         /*dict_backed=*/true};
+    ASSERT_TRUE(src.ok());
+    ASSERT_TRUE(src.view().get(49).has_value()) << "precondition: the source reads its scalars";
+    auto const src_group = src.view().offsets().group(453);
+    ASSERT_FALSE(src_group.has_value()) << "precondition: the lowered cap fails the group read";
+
+    std::pmr::monotonic_buffer_resource mr;
+    auto r = fixpp::dict::detail::owning_message_handle_from_frame(kAppV44Rmv, src.view(), &mr);
+    ASSERT_TRUE(r.has_value()) << "a lazy group cap does not refuse the copy's build";
+    EXPECT_TRUE(r->field_value(49).has_value());
+    auto const copy_group = r->view().offsets().group(453);
+    EXPECT_FALSE(copy_group.has_value()) << "the copy must keep the source's lowered cap";
+    if (!copy_group.has_value()) {
+        EXPECT_EQ(copy_group.error(), src_group.error());
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// fixpp#495 T-9 — reify SHARES an owned-route source's table
+// (`.specify/495-493-486-dict-reify-copy.md` §2.4). Mutation: arm 1 -> arm 2
+// (always copy) makes both address assertions RED.
+// ═════════════════════════════════════════════════════════════════════════════
+TEST(ReifySharesOwnedTable, HandleAndItsReifyShareTheOwnersTable) {
+    auto const dict = fixpp::test_support::make_fix44_dictionary();
+    std::shared_ptr<const fixpp::dict::table_view> sp =
+        std::make_shared<const fixpp::dict::table_view>(dict->as_table_view());
+    auto const frame = fixpp::test_support::make_nos_frame();
+    std::pmr::monotonic_buffer_resource arena;
+    auto const fv = fixpp::wire::test::make_frame_view(frame);
+    ASSERT_TRUE(fv.has_value());
+    fixpp::wire::Parser<fixpp::wire::access_mode::Index> parser{
+        fixpp::wire::detail::owned_route_key{}, sp};
+    auto mv = parser.parse(*fv, &arena);
+    ASSERT_TRUE(mv.has_value());
+
+    std::pmr::monotonic_buffer_resource mr;
+    auto h1 = fixpp::dict::reify(*mv, kProfileV44, &mr);
+    ASSERT_TRUE(h1.has_value());
+    EXPECT_EQ(h1->view().hooks().opaque_dict(), sp.get())
+        << "the handle must share the owner's table, not copy it";
+
+    auto h2 = fixpp::dict::reify(h1->view(), kProfileV44, &mr);
+    ASSERT_TRUE(h2.has_value());
+    EXPECT_EQ(h2->view().hooks().opaque_dict(), sp.get())
+        << "a handle's own view is owned-route: re-reifying it shares too";
 }
 
 }  // namespace

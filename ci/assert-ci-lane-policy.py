@@ -34,6 +34,13 @@ silently — so each is turned into a check.
      being evaluated, and the lane returns to replaying zero seeds with every
      script gate still green. The guard cannot guard its own enabling flag.
 
+  4. #411 Gate B r1 F4 (parallelism-measure half) — the campaign's `linux` and
+     `libcxx` jobs each restore Tier 1's GHCR compiler cache, restore-only,
+     never publishing. `ci/test-tier1-python-policy.sh` only reads tier1.yml,
+     so nothing pinned this workflow's restore steps at all: deleting one,
+     reordering it after `Conan install`, or adding a seed call all left every
+     existing check green.
+
 EXIT
   0  every invariant holds
   1  at least one violated (each named, with the file that breaks it)
@@ -70,6 +77,26 @@ CAMPAIGN_JOB_SOURCES = {
     "libcxx": ("tier3-libcxx.yml", "libcxx"),
     "windows": ("tier2.yml", "windows"),
 }
+
+# #411 — the campaign jobs that read Tier 1's GHCR compiler cache, restore-only.
+CCACHE_RESTORE_JOBS = {"linux", "libcxx"}
+SEED_SCRIPT = "ci/seed-ccache.sh"
+RESTORE_SCRIPT = "ci/restore-ccache.sh"
+CCACHE_ACTION_PREFIX = "hendrikmuhs/ccache-action"
+
+# #411 Gate B r2 F3 — each job's restore step is looked up by its OWN exact
+# name (the two jobs' step names differ), then compared as a canonical object:
+# exact key set, exact run: text. Both jobs restore the SAME preset expression
+# (`matrix.preset`), so one golden covers both.
+CCACHE_RESTORE_STEP_NAME = {
+    "linux": "Restore ccache from GHCR (never published from here)",
+    "libcxx": "Restore ccache from GHCR",
+}
+CCACHE_RESTORE_RUN = (
+    'echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" '
+    '--password-stdin || true\n'
+    'ci/restore-ccache.sh ${{ matrix.preset }}'
+)
 
 # The lane that must build and replay the fuzz corpora, and the flag that does it.
 FUZZ_PRESET = "linux-clang-asan"
@@ -324,6 +351,142 @@ def check_campaign_job_env(root, violations):
     return True
 
 
+def check_ccache_restore_wiring(root, violations):
+    """The campaign's `linux`/`libcxx` jobs restore Tier 1's GHCR ccache correctly.
+
+    #411 Gate B r1 F4 (parallelism-measure half). `ci/test-tier1-python-policy.sh`
+    reads only tier1.yml, so nothing pinned these jobs' ccache steps at all —
+    deleting the restore, reordering it after `Conan install`, or adding a seed
+    call all left every existing check green. A measurement job must never
+    write to the shared compiler cache: it configures for measurement, and an
+    entry it published would be served to a production lane.
+
+    #411 Gate B r2 F3. The r1 fix found restore steps by the substring
+    `RESTORE_SCRIPT in run`, which cannot distinguish a step that RUNS the
+    restore from one that merely CONTAINS the text: `if: false`, an `exit 0`
+    before the call, a commented-out call, a duplicated call and a `libcxx`
+    preset drift all passed. Each job's restore is now looked up by its own
+    exact step name and compared as a canonical object (exact key set, exact
+    run: text), the same discipline `ci/test-tier1-python-policy.sh` applies to
+    tier1.yml's own ccache steps. The substring count is kept, but only as a
+    second, independent check for a SECOND restore hiding under another name.
+
+    Returns True when a verdict was reached (including "stood down" when the
+    campaign workflow is absent), False when it could not be evaluated — same
+    contract as check_campaign_trigger/check_campaign_job_env; the caller must
+    consume it.
+    """
+    path = root / ".github" / "workflows" / CAMPAIGN_WORKFLOW
+    if not path.is_file():
+        print(f"  ccache restore wiring: {CAMPAIGN_WORKFLOW} is not present — check stood down "
+              f"(retiring the campaign is legitimate; this is a disclosure, not a pass).")
+        return True
+    try:
+        import yaml
+    except ImportError:
+        print("::warning::PyYAML unavailable — the ccache-restore-wiring check did NOT run.")
+        return False
+
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        jobs = doc["jobs"]
+    except (yaml.YAMLError, KeyError, TypeError) as exc:
+        violations.append(f"CCACHE RESTORE WIRING UNREADABLE: {CAMPAIGN_WORKFLOW} ({exc!r}).")
+        return True
+
+    checked = 0
+    for job_id in sorted(CCACHE_RESTORE_JOBS):
+        job = jobs.get(job_id)
+        if job is None:
+            violations.append(
+                f"CCACHE RESTORE WIRING UNCHECKABLE: job `{job_id}` is missing from "
+                f"{CAMPAIGN_WORKFLOW}, so its ccache restore cannot be verified. A renamed job "
+                f"must not silently stop this check.")
+            continue
+        steps = job.get("steps") or []
+        expected_name = CCACHE_RESTORE_STEP_NAME[job_id]
+        # Looked up by this job's OWN exact step name — a step matching by name
+        # is not the same as a step that actually runs (`if: false`) or actually
+        # invokes the restore script (a comment, an `exit 0`, a duplicate call).
+        # Those are the run:/key-set comparisons below, not this lookup.
+        name_hits = [i for i, st in enumerate(steps) if str(st.get("name", "")) == expected_name]
+        install_hits = [i for i, st in enumerate(steps) if str(st.get("name", "")) == "Install ccache"]
+        conan_hits = [i for i, st in enumerate(steps) if str(st.get("name", "")) == "Conan install"]
+        seed_hits = [i for i, st in enumerate(steps) if SEED_SCRIPT in str(st.get("run", ""))]
+        action_hits = [i for i, st in enumerate(steps) if str(st.get("uses", "")).startswith(CCACHE_ACTION_PREFIX)]
+        # A SEPARATE count, over EVERY step's run: text regardless of name — this
+        # is what catches a second restore call hiding under another step name,
+        # which the name lookup above cannot see by construction.
+        restore_script_hits = [i for i, st in enumerate(steps) if RESTORE_SCRIPT in str(st.get("run", ""))]
+
+        if len(name_hits) != 1:
+            violations.append(
+                f"CCACHE RESTORE MISWIRED: `{job_id}` in {CAMPAIGN_WORKFLOW} has "
+                f"{len(name_hits)} step(s) named '{expected_name}', expected exactly 1. "
+                f"A measurement job with no restore builds cold; more than one is a duplicate call.")
+        elif len(install_hits) != 1 or len(conan_hits) != 1:
+            violations.append(
+                f"CCACHE RESTORE WIRING UNCHECKABLE: `{job_id}` in {CAMPAIGN_WORKFLOW} is missing "
+                f"a unique 'Install ccache' or 'Conan install' step, so the restore's position "
+                f"cannot be verified against them.")
+        else:
+            i_install, i_restore, i_conan = install_hits[0], name_hits[0], conan_hits[0]
+            if not (i_install < i_restore < i_conan):
+                violations.append(
+                    f"CCACHE RESTORE OUT OF ORDER: `{job_id}` in {CAMPAIGN_WORKFLOW} has Install "
+                    f"ccache={i_install}, restore={i_restore}, Conan install={i_conan}; expected "
+                    f"Install < restore < Conan install. Conan's --build=missing compiles through "
+                    f"the launcher; a restore after that discards or never sees what just compiled.")
+            else:
+                restore_step = steps[i_restore]
+                raw_keys = sorted(str(k) for k in restore_step.keys())
+                restore_run = str(restore_step.get("run", "")).rstrip("\n")
+                keys_ok = raw_keys == ["name", "run"]
+                run_ok = restore_run == CCACHE_RESTORE_RUN
+                if not keys_ok:
+                    violations.append(
+                        f"CCACHE RESTORE KEY SET DRIFT: `{job_id}` in {CAMPAIGN_WORKFLOW}'s "
+                        f"'{expected_name}' step key set is {raw_keys}, expected exactly "
+                        f"['name', 'run']. An `if:` guard can disable this step without deleting "
+                        f"it or its text — the name lookup above still finds it.")
+                if not run_ok:
+                    violations.append(
+                        f"CCACHE RESTORE RUN TEXT DRIFT: `{job_id}` in {CAMPAIGN_WORKFLOW}'s "
+                        f"'{expected_name}' step run: block does not match the canonical text "
+                        f"pinned in this file. This is a GOLDEN; it reds on ANY change, cosmetic "
+                        f"included — an `exit 0` before the call, a commented-out call, a "
+                        f"duplicated call, the lost `|| true` anonymous-pull fallback and a preset "
+                        f"drift all change this text.\n"
+                        f"--- expected\n{CCACHE_RESTORE_RUN}\n"
+                        f"--- actual\n{restore_run}")
+                if len(restore_script_hits) != 1:
+                    violations.append(
+                        f"CCACHE RESTORE MISWIRED: `{job_id}` in {CAMPAIGN_WORKFLOW} has "
+                        f"{len(restore_script_hits)} step(s) invoking {RESTORE_SCRIPT}, expected "
+                        f"exactly 1 — a second restore under a different name is a duplicate call "
+                        f"the name lookup above cannot see.")
+                if keys_ok and run_ok and len(restore_script_hits) == 1:
+                    checked += 1
+
+        if seed_hits:
+            violations.append(
+                f"CCACHE SEED IN A MEASUREMENT JOB: `{job_id}` in {CAMPAIGN_WORKFLOW} has "
+                f"{len(seed_hits)} step(s) invoking {SEED_SCRIPT}. A measurement job must never "
+                f"publish to the shared compiler cache (#411) — its restore step's own comment "
+                f"says so.")
+        if action_hits:
+            violations.append(
+                f"CCACHE ACTION IN A MEASUREMENT JOB: `{job_id}` in {CAMPAIGN_WORKFLOW} still has "
+                f"{len(action_hits)} {CCACHE_ACTION_PREFIX} step(s). #411 moved this workflow's "
+                f"ccache restore to GHCR.")
+
+    if checked:
+        print(f"  ccache restore wiring: {checked} job(s) restore Tier 1's GHCR ccache via a "
+              f"canonical name/key-set/run-text object, exactly once by call count, correctly "
+              f"positioned, and never publish.")
+    return True
+
+
 def check_campaign_trigger(root, violations):
     """The A-B-A campaign must stay dispatch-only.
 
@@ -402,6 +565,283 @@ def check_campaign_trigger(root, violations):
     return True
 
 
+# #465 — a guard that admits `push` trusts the workflow's OWN trigger for the ref.
+# A publish guard whose `push` arm does not re-check `github.ref` is main-only
+# only through `on.push.branches`. A rolling published tag means a trigger
+# widened to a feature branch would let that branch overwrite what main and
+# every PR restore.
+#
+# PUSH_TRUSTING_ROSTER below is checked UNCONDITIONALLY: membership does not
+# depend on how a workflow's guard is spelled, so respelling or removing the
+# guard cannot drop a roster member out of scope. Any OTHER workflow is held
+# to the same rule only while one of its strings still pairs
+# `github.event_name` with a quoted `push` literal — that can also match a
+# non-publish expression (a `concurrency:` key, for instance), which is the
+# safe direction, since a main-only trigger satisfies every such workflow. A
+# guard spelled another way, split into a composite action, or living in a
+# `workflow_call` workflow (where `github.event_name` is the caller's event)
+# is not caught by that added match.
+PUSH_TRUSTING_ROSTER = ("tier1.yml", "tier2.yml", "tier3-libcxx.yml")
+PUSH_EVENT_LITERAL = re.compile(r"""['"]push['"]""")
+PUSH_TRIGGER_KEYS = {"branches", "paths", "paths-ignore"}
+
+
+def _strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from _strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _strings(v)
+
+
+def check_push_trusting_triggers(root, violations):
+    """Every workflow in PUSH_TRUSTING_ROSTER, plus any other workflow whose
+    expressions pair `github.event_name` with a quoted `push` literal, must be
+    main-only on push.
+
+    The roster is checked unconditionally: how its guard is spelled does not
+    matter. A workflow outside the roster is checked only while it still
+    matches that one idiom — a guard spelled another way, split into a
+    composite action, or living in a `workflow_call` workflow (where
+    `github.event_name` is the caller's event) is invisible to that half of
+    this check.
+
+    Returns the number of workflows found to match the idiom (the roster is
+    not counted here — see the zero-refusal in main()), or None when PyYAML
+    is unavailable.  ZERO IS A FAILURE the caller reports: if the guards move
+    or this pattern stops matching, "0 workflows, 0 violations" reads like a
+    clean tree.
+    """
+    try:
+        import yaml
+    except ImportError:
+        print("::warning::PyYAML unavailable — the push-trigger check did NOT run.")
+        return None
+
+    trusting = 0
+    seen_roster = set()
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            violations.append(
+                f"PUSH TRIGGER UNREADABLE: {path.name} does not parse as YAML "
+                f"({exc.__class__.__name__}), so whether its publish guards are main-only "
+                f"cannot be decided.")
+            continue
+        if not isinstance(doc, dict):
+            continue
+        # YAML 1.1: a bare `on:` key loads as the boolean True (see check_campaign_trigger).
+        block = doc.get("on", doc.get(True))
+        body = {k: v for k, v in doc.items() if k not in ("on", True)}
+        in_roster = path.name in PUSH_TRUSTING_ROSTER
+        admits = any("github.event_name" in t and PUSH_EVENT_LITERAL.search(t)
+                     for t in _strings(body))
+        if admits:
+            trusting += 1
+        if not (in_roster or admits):
+            continue
+        if in_roster:
+            seen_roster.add(path.name)
+
+        if isinstance(block, str):
+            block = {block: None}
+        elif isinstance(block, list):
+            block = {k: None for k in block}
+        elif not isinstance(block, dict):
+            block = {}
+        if "push" not in block:
+            print(f"  push trigger: {path.name} admits `push` in an expression but has no own "
+                  f"push trigger — this check does not evaluate a `workflow_call` caller's event")
+            continue
+        push = block["push"]
+        problems = []
+        if not isinstance(push, dict):
+            problems.append("`push` has no filters, so it fires on every branch and tag")
+        else:
+            extra = sorted(set(push) - PUSH_TRIGGER_KEYS)
+            if extra:
+                problems.append(f"on.push carries {', '.join(extra)}, which widens what "
+                                f"`github.ref` can be on a push")
+            if push.get("branches") != ["main"]:
+                problems.append(f"on.push.branches is {push.get('branches')!r}, expected ['main']")
+        if problems:
+            violations.append(
+                f"PUSH TRIGGER NOT MAIN-ONLY: {path.name}: {'; '.join(problems)}. Its expressions "
+                f"admit `github.event_name == 'push'` without re-checking `github.ref`, so a "
+                f"non-main push would publish over the rolling tags main and every PR restore.")
+        else:
+            print(f"  push trigger: {path.name} is main-only")
+
+    missing = sorted(set(PUSH_TRUSTING_ROSTER) - seen_roster)
+    if missing:
+        violations.append(
+            f"PUSH TRIGGER ROSTER MISSING: {', '.join(missing)} not found (or not readable "
+            f"as a YAML mapping) under .github/workflows — update PUSH_TRUSTING_ROSTER if it "
+            f"was renamed or removed, or restore its trigger pin if it still publishes.")
+    return trusting
+
+
+# #431 Gate B r1 (Codex #5/#4a/P2): the interop gate step exists in each tier
+# workflow's cheapest non-sanitizer leg, is not silently disarmed, and its
+# label/checker-call wiring is intact.
+#
+# What is asserted here is deliberately the STATIC, per-workflow shape:
+# the step exists exactly once, its leg guard, no continue-on-error, every
+# `ctest -L interop` invocation carries the label, the pin file is read, and
+# the checker invocation carries every required flag. The CR-normalisation,
+# exactly-once schema-check exclusion and ctest-failure annotation this step
+# also carries are exercised by EXECUTING the extracted run: text against a
+# fake ctest in ci/test-interop-gate-step.sh — a static grep for those lines
+# proves they are present, not that the arithmetic they enable is correct,
+# and the executed cells are the stronger claim for exactly that reason.
+INTEROP_STEP_NAME = "Interop gate — ctest -L interop, skip set asserted (#431)"
+INTEROP_ROSTER = {
+    "tier1.yml": "linux-clang-release",
+    "tier2.yml": "windows-msvc-release",
+    "tier3-libcxx.yml": "linux-clang-libc++",
+}
+
+
+def check_interop_gate_step(root, violations):
+    """The #431 interop gate step is wired correctly in every tier workflow.
+
+    Returns True when a verdict was reached (including "stood down" for a
+    missing workflow, reported as a violation rather than silently skipped),
+    False only when PyYAML is unavailable — same contract as the campaign
+    checks above; the caller must consume it.
+    """
+    wf_dir = root / ".github" / "workflows"
+    try:
+        import yaml
+    except ImportError:
+        print("::warning::PyYAML unavailable — the interop-gate-step check did NOT run.")
+        return False
+
+    checked = 0
+    for wf_name, preset in INTEROP_ROSTER.items():
+        path = wf_dir / wf_name
+        if not path.is_file():
+            violations.append(f"INTEROP GATE STEP UNCHECKABLE: {wf_name} is missing.")
+            continue
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            violations.append(f"INTEROP GATE STEP UNREADABLE: {wf_name} ({exc!r}).")
+            continue
+
+        hits = [step for job in (doc.get("jobs") or {}).values()
+                for step in (job.get("steps") or [])
+                if str(step.get("name", "")) == INTEROP_STEP_NAME]
+        if len(hits) != 1:
+            violations.append(
+                f"INTEROP GATE STEP MISWIRED: {wf_name} has {len(hits)} step(s) named "
+                f"'{INTEROP_STEP_NAME}', expected exactly 1.")
+            continue
+        step = hits[0]
+        run = str(step.get("run", ""))
+        raw_keys = sorted(str(k) for k in step.keys())
+
+        want_if = f"matrix.preset == '{preset}'"
+        got_if = str(step.get("if", ""))
+        if got_if != want_if:
+            violations.append(
+                f"INTEROP GATE STEP GUARD DRIFT: {wf_name}'s '{INTEROP_STEP_NAME}' step "
+                f"has if: `{got_if}`, expected exactly `{want_if}` — this step must run on "
+                f"its tier's cheapest non-sanitizer leg only, by design.")
+
+        if "continue-on-error" in raw_keys:
+            violations.append(
+                f"INTEROP GATE STEP TOLERATES FAILURE: {wf_name}'s '{INTEROP_STEP_NAME}' "
+                f"step carries continue-on-error — a failing interop gate would report "
+                f"this leg green.")
+
+        # Counted over actual `ctest ... -L interop` INVOCATIONS, not the
+        # diagnostic `echo`/`::error` lines that also happen to contain the
+        # substring `-L interop` when they quote it back at the operator.
+        # `\b` after `interop` so `-L interopX` (a mutated label) does not
+        # count as a match of its own prefix.
+        l_count = len(re.findall(
+            r"ctest --preset \$\{\{ matrix\.preset \}\} -L interop\b", run))
+        if l_count != 2:
+            violations.append(
+                f"INTEROP GATE STEP LABEL DRIFT: {wf_name}'s '{INTEROP_STEP_NAME}' step "
+                f"invokes `ctest ... -L interop` {l_count} time(s), expected exactly 2 (the "
+                f"registration-count call and the real GTEST_OUTPUT run).")
+
+        # The actual READ (an input redirect), not merely a mention — the
+        # step's own diagnostic `echo` text also names the file when it
+        # reports a mismatch, which is not evidence the file is read.
+        if "< ci/expected-interop-tests.txt" not in run:
+            violations.append(
+                f"INTEROP GATE STEP PIN READ MISSING: {wf_name}'s '{INTEROP_STEP_NAME}' "
+                f"step no longer reads ci/expected-interop-tests.txt.")
+
+        for flag in ("--json-dir", "--bin-dir", "--expected-skips", "--expected-count"):
+            if flag not in run:
+                violations.append(
+                    f"INTEROP GATE STEP CHECKER CALL DRIFT: {wf_name}'s "
+                    f"'{INTEROP_STEP_NAME}' step's checker invocation is missing `{flag}`.")
+
+        # tier2 is exempt from the tier1==tier3 byte-identity check below; an
+        # execution-only check would need a fake cygpath/python on top of the
+        # D-tier2-* cells, which only run the truncated derivation-only body
+        # (up to `binaries=`, before this line).
+        if 'unset "${!GTEST_@}"' not in run:
+            violations.append(
+                f"INTEROP GATE STEP GTEST CONTROLS NOT UNSET: {wf_name}'s "
+                f"'{INTEROP_STEP_NAME}' step no longer unsets inherited GTEST_* "
+                f"variables before either ctest invocation.")
+
+        # gtest also takes a filter default from TESTBRIDGE_TEST_ONLY, which
+        # the GTEST_ prefix unset above does not reach. The unset must be a
+        # plain `unset NAME...` command whose arguments are only variable names
+        # (backslash continuations joined) — not a mention, not `unset -f`,
+        # not a line carrying a comment or a second command.
+        joined = re.sub(r"\\\n\s*", " ", run)
+        unset_re = re.compile(r"\s*unset((?:\s+[A-Za-z_][A-Za-z0-9_]*)+)\s*")
+        if not any((m := unset_re.fullmatch(ln)) and "TESTBRIDGE_TEST_ONLY" in m.group(1).split()
+                   for ln in joined.splitlines()):
+            violations.append(
+                f"INTEROP GATE STEP TESTBRIDGE NOT UNSET: {wf_name}'s "
+                f"'{INTEROP_STEP_NAME}' step no longer unsets TESTBRIDGE_TEST_ONLY "
+                f"before either ctest invocation.")
+
+        checked += 1
+
+    # tier1 and tier3-libcxx both run the step under `python3`/no cygpath, so
+    # their run: text should be byte-identical (only the `if:` preset
+    # literal differs, which is a separate YAML key). tier2 legitimately
+    # differs (`shell: bash`, cygpath, `python`) and is not compared here.
+    t1 = wf_dir / "tier1.yml"
+    t3 = wf_dir / "tier3-libcxx.yml"
+    if t1.is_file() and t3.is_file():
+        try:
+            d1 = yaml.safe_load(t1.read_text(encoding="utf-8"))
+            d3 = yaml.safe_load(t3.read_text(encoding="utf-8"))
+            r1 = next(str(s.get("run", "")) for job in d1["jobs"].values()
+                      for s in (job.get("steps") or []) if s.get("name") == INTEROP_STEP_NAME)
+            r3 = next(str(s.get("run", "")) for job in d3["jobs"].values()
+                      for s in (job.get("steps") or []) if s.get("name") == INTEROP_STEP_NAME)
+            if r1 != r3:
+                violations.append(
+                    "INTEROP GATE STEP DRIFT: tier1.yml and tier3-libcxx.yml's "
+                    f"'{INTEROP_STEP_NAME}' run: blocks are not byte-identical, though "
+                    "both run under python3 with no cygpath step — a fix landed in one "
+                    "and not the other.")
+        except (StopIteration, KeyError, TypeError, yaml.YAMLError):
+            pass  # already reported above as MISWIRED/UNREADABLE
+
+    if checked:
+        print(f"  interop gate step: {checked}/{len(INTEROP_ROSTER)} tier workflow(s) wire "
+              f"the #431 step correctly (leg guard, no continue-on-error, -L interop twice, "
+              f"pin-file read, checker invocation args).")
+    return True
+
+
 def main():
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     if not root.is_dir():
@@ -413,19 +853,27 @@ def main():
     fuzz_seen = check_fuzz_lane(root, violations)
     campaign_judged = check_campaign_trigger(root, violations)
     campaign_judged = check_campaign_job_env(root, violations) and campaign_judged
+    campaign_judged = check_ccache_restore_wiring(root, violations) and campaign_judged
     check_sccache_pins(root, violations)
+    push_trusting = check_push_trusting_triggers(root, violations)
+    interop_judged = check_interop_gate_step(root, violations)
     if apt_seen is None or fuzz_seen is None:
+        return 2
+    if not interop_judged:
+        print("::error::the interop-gate-step invariant could not be evaluated (PyYAML "
+              "unavailable). Refusing to report `all invariants hold` over a check that did "
+              "not run.")
         return 2
     # A check that could not run must not be reported as one that passed.
     if not campaign_judged:
-        # ⚠️ Names the FLAG, not one of its inputs. Two checks feed
-        # `campaign_judged` (trigger and job-env); this said "the
-        # campaign-trigger invariant", so a PyYAML-absent run — where it is the
-        # job-env check that stands down — pointed the operator at a check that
-        # had run fine.
+        # ⚠️ Names the FLAG, not one of its inputs. Three checks feed
+        # `campaign_judged` (trigger, job-env, ccache-restore-wiring); this said
+        # "the campaign-trigger invariant", so a PyYAML-absent run — where it is
+        # a DIFFERENT check that stands down — pointed the operator at a check
+        # that had run fine.
         print("::error::a campaign invariant could not be evaluated (see the warning above): "
-              "the trigger check, the job-env check, or both. Refusing to report "
-              "`all invariants hold` over a check that did not run.")
+              "the trigger check, the job-env check, the ccache-restore-wiring check, or some "
+              "combination. Refusing to report `all invariants hold` over a check that did not run.")
         return 2
 
     # ⚠️ AN EMPTY SCAN IS AN INSTRUMENT FAILURE, NOT A PASS. If the workflows move
@@ -436,6 +884,18 @@ def main():
         print("::error::found ZERO apt-backed install sites across the workflows. Either "
               "they moved or this check's patterns are broken; refusing to report clean "
               "on an empty scan.")
+        return 2
+
+    if push_trusting is None:
+        print("::error::the push-trigger check could not be evaluated (PyYAML unavailable). "
+              "Refusing to report `all invariants hold` over a check that did not run.")
+        return 2
+    if push_trusting == 0:
+        print("::error::found ZERO workflows whose expressions admit a `push` event. "
+              "(PUSH_TRUSTING_ROSTER is pinned regardless of this count.) Either the "
+              "publish guards now re-check `github.ref` themselves (then retire "
+              "check_push_trusting_triggers deliberately) or this check's pattern is broken; "
+              "refusing to report clean on an empty scan.")
         return 2
 
     print(f"  apt-backed install sites scanned: {apt_seen} (all must use {GUARD})")

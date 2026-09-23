@@ -235,6 +235,9 @@ elif printf '%s\n' "$t11_out" | grep -q "^ci lane policy: all invariants hold"; 
 elif ! printf '%s\n' "$t11_out" | grep -qF "could not be evaluated"; then
   printf '%s\n' "$t11_out" | sed 's/^/  | /'
   bad "T11 PyYAML absent exited 2 but without saying which check did not run"
+elif ! printf '%s\n' "$t11_out" | grep -qF "push-trigger check did NOT run"; then
+  printf '%s\n' "$t11_out" | sed 's/^/  | /'
+  bad "T11 PyYAML absent exited 2 but the push-trigger check did not say it stood down"
 else
   ok "T11 PyYAML absent fails closed instead of reporting the all-clear"
 fi
@@ -319,6 +322,238 @@ else
   ok "T14 the shipped to_json handles empty/single/duplicate/whitespace lane lists under bash"
 fi
 
+# ── T15: the linux job's ccache restore step deleted ─────────────────────────
+#
+# #411 Gate B r1 F4 (parallelism-measure half): the campaign's `linux`/`libcxx`
+# jobs restore Tier 1's GHCR compiler cache, restore-only, and nothing in this
+# repo pinned that at all — ci/test-tier1-python-policy.sh only reads
+# tier1.yml. Deleting the restore silently returns the lane to a cold build.
+fresh
+python3 - "$WORK/t/.github/workflows/parallelism-measure.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '''      - name: Restore ccache from GHCR (never published from here)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          ci/restore-ccache.sh ${{ matrix.preset }}
+
+'''
+assert old in s, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "", 1), encoding="utf-8")
+MUT
+expect "T15 the parallelism linux job's ccache restore deleted is caught" 1 "CCACHE RESTORE MISWIRED"
+
+# ── T16: a seed call added to a measurement job ──────────────────────────────
+#
+# A measurement job must never publish to the shared compiler cache — an entry
+# it published would be served to a production lane it does not represent.
+fresh
+python3 - "$WORK/t/.github/workflows/parallelism-measure.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+start = s.index("\n  linux:\n")
+end = s.index("\n  libcxx:\n", start)
+before, job, after = s[:start], s[start:end], s[end:]
+anchor = "          ci/restore-ccache.sh ${{ matrix.preset }}\n"
+assert job.count(anchor) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+seed = "      - name: Save ccache to GHCR (never — measurement must not publish)\n        run: ci/seed-ccache.sh ${{ matrix.preset }}\n"
+job = job.replace(anchor, anchor + seed, 1)
+p.write_text(before + job + after, encoding="utf-8")
+MUT
+expect "T16 a seed call added to a parallelism measurement job is caught" 1 "CCACHE SEED IN A MEASUREMENT JOB"
+
+# ── T17: the restore moved after Conan install ───────────────────────────────
+#
+# restore-ccache.sh refuses once anything has compiled through the launcher;
+# moving the restore after Conan install would discard the just-built objects
+# (or, if it does not refuse, waste the compile that already happened cold).
+fresh
+python3 - "$WORK/t/.github/workflows/parallelism-measure.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+start = s.index("\n  linux:\n")
+end = s.index("\n  libcxx:\n", start)
+before, job, after = s[:start], s[start:end], s[end:]
+i = job.index("      - name: Restore ccache from GHCR (never published from here)\n")
+j = job.index("          ci/restore-ccache.sh ${{ matrix.preset }}\n", i) + len("          ci/restore-ccache.sh ${{ matrix.preset }}\n")
+restore = job[i:j]
+assert restore, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+job = job[:i] + job[j:]
+conan = "      - name: Conan install\n"
+assert job.count(conan) == 1, job.count(conan)
+k = job.index(conan)
+k = job.index("\n\n", k) + 2
+job = job[:k] + restore + "\n" + job[k:]
+p.write_text(before + job + after, encoding="utf-8")
+MUT
+expect "T17 the parallelism linux restore moved after Conan install is caught" 1 "CCACHE RESTORE OUT OF ORDER"
+
+# ── T18: if: false added to the linux restore ────────────────────────────────
+#
+# #411 Gate B r2 F3: the r1 checker found this step by the substring
+# `RESTORE_SCRIPT in run`, so a disabled-but-present step still counted as
+# "restoring". The step's key set is now compared as a canonical object.
+fresh
+python3 - "$WORK/t/.github/workflows/parallelism-measure.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = "      - name: Restore ccache from GHCR (never published from here)\n        run: |\n"
+new = "      - name: Restore ccache from GHCR (never published from here)\n        if: false\n        run: |\n"
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, new, 1), encoding="utf-8")
+MUT
+expect "T18 if: false added to the parallelism linux restore is caught" 1 "CCACHE RESTORE KEY SET DRIFT"
+
+# ── T19: exit 0 inserted before the linux restore invocation ────────────────
+#
+# The restore step still contains the text `ci/restore-ccache.sh`, so the
+# substring-only r1 check saw a live restore; the call is unreachable.
+fresh
+python3 - "$WORK/t/.github/workflows/parallelism-measure.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+start = s.index("\n  linux:\n")
+end = s.index("\n  libcxx:\n", start)
+before, job, after = s[:start], s[start:end], s[end:]
+old = "          ci/restore-ccache.sh ${{ matrix.preset }}\n"
+new = "          exit 0\n          ci/restore-ccache.sh ${{ matrix.preset }}\n"
+assert job.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+job = job.replace(old, new, 1)
+p.write_text(before + job + after, encoding="utf-8")
+MUT
+expect "T19 exit 0 inserted before the parallelism linux restore call is caught" 1 "CCACHE RESTORE RUN TEXT DRIFT"
+
+# ── T20: the libcxx restore preset drifts from matrix.preset ────────────────
+#
+# Only `linux`'s preset argument was ever checked before this round; the
+# libcxx job's own call was unpinned.
+fresh
+python3 - "$WORK/t/.github/workflows/parallelism-measure.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+start = s.index("\n  libcxx:\n")
+end = s.index("\n  windows:\n", start)
+before, job, after = s[:start], s[start:end], s[end:]
+old = "          ci/restore-ccache.sh ${{ matrix.preset }}\n"
+new = "          ci/restore-ccache.sh linux-clang-debug\n"
+assert job.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+job = job.replace(old, new, 1)
+p.write_text(before + job + after, encoding="utf-8")
+MUT
+expect "T20 the parallelism libcxx restore preset drifts from matrix.preset is caught" 1 "CCACHE RESTORE RUN TEXT DRIFT"
+
+# ── T21-T25: #465 — push-admitting publish guards trust the push trigger ─────
+#
+# A guard whose `push` arm admits `github.event_name == 'push'` without
+# re-checking `github.ref` is main-only only through `on.push.branches`, so a
+# widened trigger admits a non-main push the guard still treats as trusted.
+# T21 widens tier2's branches to include a feature branch; T22 adds a `tags:`
+# key under tier3's push trigger; T23 removes tier3's `branches:`, leaving an
+# unfiltered push; T24 is a new, unlisted workflow whose guard still matches
+# the idiom with a bare `push` trigger; T25 removes the idiom's literal from
+# every workflow, leaving zero guards for the check to find.
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '  push:\n    branches: ["main"]\n'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, '  push:\n    branches: ["main", "feature/**"]\n', 1), encoding="utf-8")
+MUT
+expect "T21 tier2 push trigger broadened to a feature branch is caught" 1 "PUSH TRIGGER NOT MAIN-ONLY: tier2.yml"
+
+fresh
+python3 - "$WORK/t/.github/workflows/tier3-libcxx.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '  push:\n    branches: ["main"]\n'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, old + '    tags: ["v*"]\n', 1), encoding="utf-8")
+MUT
+expect "T22 tags: added under tier3's push trigger is caught" 1 "PUSH TRIGGER NOT MAIN-ONLY: tier3-libcxx.yml: on.push carries tags"
+
+# Dropping `branches:` leaves only paths-ignore, which fires on EVERY branch.
+fresh
+python3 - "$WORK/t/.github/workflows/tier3-libcxx.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '  push:\n    branches: ["main"]\n'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, '  push:\n', 1), encoding="utf-8")
+MUT
+expect "T23 tier3 push trigger with branches: removed is caught" 1 "on.push.branches is None"
+
+# A NEW workflow, not on the roster, is caught while its guard still uses the
+# exact `github.event_name` + quoted `push` idiom — nobody has to add it to a
+# list.
+fresh
+cat > "$WORK/t/.github/workflows/new-publisher.yml" <<'WF'
+name: new publisher
+on: push
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save ccache to GHCR
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: ci/seed-ccache.sh linux-clang-debug
+WF
+expect "T24 a new workflow with a push guard and a bare push trigger is caught" 1 "PUSH TRIGGER NOT MAIN-ONLY: new-publisher.yml: \`push\` has no filters"
+
+# Zero push-admitting workflows is an instrument failure, not a pass.
+fresh
+python3 - "$WORK/t/.github/workflows" <<'MUT'
+import sys, pathlib, re
+n = 0
+for p in pathlib.Path(sys.argv[1]).glob("*.yml"):
+    s = p.read_text(encoding="utf-8")
+    t, k = re.subn(r"""github\.event_name == 'push'""", "github.event_name == 'pushed'", s)
+    n += k
+    p.write_text(t, encoding="utf-8")
+assert n >= 9, f"MUTATION DID NOT APPLY ({n} sites) — re-point the pattern, do not delete the mutant"
+MUT
+expect "T25 zero push-admitting workflows is an instrument failure, not a pass" 2 "ZERO workflows whose expressions admit a \`push\` event"
+
+# ── T26: #465 F1 — the roster is checked even when a workflow's guard no
+# longer matches the derived idiom ──────────────────────────────────────────
+#
+# The population used to be derived only: a workflow entered scope while its
+# strings paired `github.event_name` with a quoted `push` literal. A guard
+# respelled away from that literal removed the workflow from scope even if
+# its trigger was widened at the same time. PUSH_TRUSTING_ROSTER closes that:
+# tier2.yml is checked whether or not its guard still matches the idiom.
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old_guard = "github.event_name == 'push' ||"
+new_guard = "github.event_name != 'pull_request' ||"
+n = s.count(old_guard)
+assert n == 2, f"MUTATION DID NOT APPLY ({n} sites) — re-point the pattern, do not delete the mutant"
+s = s.replace(old_guard, new_guard)
+old_branches = '  push:\n    branches: ["main"]\n'
+assert s.count(old_branches) == 1, "MUTATION DID NOT APPLY (branches) — re-point the pattern, do not delete the mutant"
+s = s.replace(old_branches, '  push:\n    branches: ["main", "feature/**"]\n', 1)
+p.write_text(s, encoding="utf-8")
+MUT
+expect "T26 a roster member is caught even when its guard no longer matches the idiom" 1 "PUSH TRIGGER NOT MAIN-ONLY: tier2.yml"
+
+# ── T27: #465 F2 — a NEW workflow using LIST-FORM `on: [push, ...]` is caught
+# by the list-normalisation arm, not treated as vacuous ─────────────────────
+fresh
+cat > "$WORK/t/.github/workflows/list-form-publisher.yml" <<'WF'
+name: list form publisher
+on: [push, workflow_dispatch]
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save ccache to GHCR
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: ci/seed-ccache.sh linux-clang-debug
+WF
+expect "T27 a new workflow with list-form on: [push, ...] is caught, not read as vacuous" 1 "PUSH TRIGGER NOT MAIN-ONLY: list-form-publisher.yml: \`push\` has no filters"
+
 # ── T6: THE EMPTY SCAN ───────────────────────────────────────────────────────
 #
 # If the workflows move or the patterns break, "0 violations over 0 sites" must
@@ -328,14 +563,180 @@ cp "$REPO/CMakePresets.json" "$WORK/t/"
 printf 'name: nothing\non: push\njobs: {}\n' > "$WORK/t/.github/workflows/empty.yml"
 expect "T6 an empty scan is an instrument failure, not a pass" 2 "ZERO apt-backed install sites"
 
+# ── T28-T34: fixpp#431 Gate B r1 (Codex #5/#4a P2) — the interop gate step's
+# static wiring, in each of the three tier workflows. Codex #1's CRLF defect
+# and the CR-normalisation/exactly-once/ctest-failure-annotation fixes for it
+# are exercised by EXECUTING the extracted run: text in
+# ci/test-interop-gate-step.sh; these cells are the static leg-guard/
+# continue-on-error/label/pin-read/checker-call/identity shape only. ─────────
+
+# T28 (M-RC1f): the step's `if:` leg guard drifts to a different preset.
+fresh
+python3 - "$WORK/t/.github/workflows/tier1.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = ('- name: "Interop gate — ctest -L interop, skip set asserted (#431)"\n'
+       "        if: matrix.preset == 'linux-clang-release'\n")
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+new = old.replace("linux-clang-release'\n", "linux-clang-debug'\n")
+p.write_text(s.replace(old, new, 1), encoding="utf-8")
+MUT
+expect "T28 tier1 interop gate step's if: preset guard drifts (M-RC1f) is caught" 1 "INTEROP GATE STEP GUARD DRIFT: tier1.yml"
+
+# T29 (M-RC1e): continue-on-error added to the gate step.
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = ('- name: "Interop gate — ctest -L interop, skip set asserted (#431)"\n'
+       "        if: matrix.preset == 'windows-msvc-release'\n"
+       "        shell: bash\n")
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+new = old + "        continue-on-error: true\n"
+p.write_text(s.replace(old, new, 1), encoding="utf-8")
+MUT
+expect "T29 tier2 interop gate step gains continue-on-error (M-RC1e) is caught" 1 "INTEROP GATE STEP TOLERATES FAILURE: tier2.yml"
+
+# T30 (M-RC1d): the registration ctest call's label drifts to -L interopX.
+fresh
+python3 - "$WORK/t/.github/workflows/tier3-libcxx.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = "ctest --preset ${{ matrix.preset }} -L interop -N"
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, old.replace("-L interop", "-L interopX"), 1), encoding="utf-8")
+MUT
+expect "T30 tier3 registration ctest call's label drifts to -L interopX (M-RC1d) is caught" 1 "INTEROP GATE STEP LABEL DRIFT: tier3-libcxx.yml"
+
+# T31: the gate step stops reading the pin file at all (hardcodes `expected`).
+fresh
+python3 - "$WORK/t/.github/workflows/tier1.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = ("          expected=$(tr -d '\\r' < ci/expected-interop-tests.txt \\\n"
+       "                       | awk -v p=\"${{ matrix.preset }}\" '$1 == p { print $2; exit }')\n")
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "          expected=30\n", 1), encoding="utf-8")
+MUT
+expect "T31 tier1 interop gate step stops reading the pin file is caught" 1 "INTEROP GATE STEP PIN READ MISSING: tier1.yml"
+
+# T32: the checker invocation drops --expected-count.
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '            --expected-count "$binaries"\n'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "", 1), encoding="utf-8")
+MUT
+expect "T32 tier2 checker invocation drops --expected-count is caught" 1 "INTEROP GATE STEP CHECKER CALL DRIFT: tier2.yml"
+
+# T32b: the checker invocation drops --bin-dir.
+fresh
+python3 - "$WORK/t/.github/workflows/tier1.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '            --bin-dir "build/${{ matrix.preset }}/bin" \\\n'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "", 1), encoding="utf-8")
+MUT
+expect "T32b tier1 checker invocation drops --bin-dir is caught" 1 "INTEROP GATE STEP CHECKER CALL DRIFT: tier1.yml"
+
+# T33: the gate step is renamed away — zero steps match the pinned name.
+fresh
+python3 - "$WORK/t/.github/workflows/tier1.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '- name: "Interop gate — ctest -L interop, skip set asserted (#431)"'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, '- name: "Interop gate (renamed)"', 1), encoding="utf-8")
+MUT
+expect "T33 tier1 interop gate step renamed away is caught" 1 "INTEROP GATE STEP MISWIRED: tier1.yml has 0 step(s)"
+
+# T34: tier3's body drifts from tier1's byte-identical text (both run under
+# python3 with no cygpath, so they must match exactly).
+fresh
+python3 - "$WORK/t/.github/workflows/tier3-libcxx.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = 'echo "::error title=Interop gate::ctest -L interop failed on ${{ matrix.preset }}."'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, 'echo "::error title=Interop gate::ctest failed on ${{ matrix.preset }}."', 1), encoding="utf-8")
+MUT
+expect "T34 tier3 interop gate body drifts from tier1's byte-identical text is caught" 1 "INTEROP GATE STEP DRIFT: tier1.yml and tier3-libcxx.yml"
+
+# T35: tier2's GTEST-controls unset line is removed. tier2 is exempt from the
+# tier1==tier3 byte-identity check (T34) and from the executed D-tier2-*
+# derivation cells (which truncate before this line).
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = '          unset "${!GTEST_@}"\n'
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "", 1), encoding="utf-8")
+MUT
+expect "T35 tier2 GTEST controls unset line removed is caught" 1 "INTEROP GATE STEP GTEST CONTROLS NOT UNSET: tier2.yml"
+
+# T36: tier2's TESTBRIDGE_TEST_ONLY is dropped from its continued unset line.
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = "INTEROP_QUICKFIX_J_HOST \\\n                TESTBRIDGE_TEST_ONLY\n"
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "INTEROP_QUICKFIX_J_HOST\n", 1), encoding="utf-8")
+MUT
+expect "T36 tier2 TESTBRIDGE_TEST_ONLY dropped from the unset is caught" 1 "INTEROP GATE STEP TESTBRIDGE NOT UNSET: tier2.yml"
+
+# T37: the same drop, with the name kept only in a comment — a mention is not
+# an unset.
+fresh
+python3 - "$WORK/t/.github/workflows/tier2.yml" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = "INTEROP_QUICKFIX_J_HOST \\\n                TESTBRIDGE_TEST_ONLY\n"
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, "INTEROP_QUICKFIX_J_HOST\n          # TESTBRIDGE_TEST_ONLY\n", 1), encoding="utf-8")
+MUT
+expect "T37 tier2 TESTBRIDGE_TEST_ONLY kept only in a comment is caught" 1 "INTEROP GATE STEP TESTBRIDGE NOT UNSET: tier2.yml"
+
+# T38/T39: an `unset` line that names TESTBRIDGE_TEST_ONLY without unsetting
+# the variable — in a trailing comment, or as a function via `unset -f`.
+for form in inline-comment unset-f; do
+  fresh
+  python3 - "$WORK/t/.github/workflows/tier2.yml" "$form" <<'MUT'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text(encoding="utf-8")
+old = "INTEROP_QUICKFIX_J_HOST \\\n                TESTBRIDGE_TEST_ONLY\n"
+new = {"inline-comment": "INTEROP_QUICKFIX_J_HOST # TESTBRIDGE_TEST_ONLY\n",
+       "unset-f": "INTEROP_QUICKFIX_J_HOST\n          unset -f TESTBRIDGE_TEST_ONLY\n"}[sys.argv[2]]
+assert s.count(old) == 1, "MUTATION DID NOT APPLY — re-point the pattern, do not delete the mutant"
+p.write_text(s.replace(old, new, 1), encoding="utf-8")
+MUT
+  case "$form" in
+    inline-comment) label="T38 tier2 TESTBRIDGE_TEST_ONLY only in a trailing comment on the unset line is caught" ;;
+    unset-f)        label="T39 tier2 \`unset -f TESTBRIDGE_TEST_ONLY\` (a function unset) is caught" ;;
+  esac
+  expect "$label" 1 "INTEROP GATE STEP TESTBRIDGE NOT UNSET: tier2.yml"
+done
+
 # ── The harness's own execution count ────────────────────────────────────────
 #
 # ⚠️ ADDED WITH THE FOUR NEW CELLS, and the omission is the point: a `cell`
 # invocation lost to an editing slip removes a gate SILENTLY, and the tally
 # below would still read "N passed, 0 failed" for a smaller N. Both sibling
 # harnesses in this directory assert their count; this one did not, and four
-# cells were added to it before anyone noticed.
-CELLS_DECLARED=16
+# cells were added to it before anyone noticed. T15-T17 (#411 Gate B r1 F4)
+# added the parallelism-measure ccache-restore-wiring cells; T18-T20 (#411
+# Gate B r2 F3) added the false-greens the r1 checker's substring match still
+# admitted (a disabled step, an unreachable call, and libcxx preset drift).
+# T21-T25 (#465) added the push-trigger cells for push-admitting publish guards.
+# T26 (#465 Gate B r1 F1) added the roster-floor cell — a roster member whose
+# guard is respelled away from the idiom must still be caught. T27 (#465 Gate
+# B r1 F2) added the list-form `on:` cell the per-line assessment had claimed
+# without a driving test.
+CELLS_DECLARED=42
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$TOTAL" -ne "$CELLS_DECLARED" ]; then

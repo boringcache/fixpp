@@ -76,24 +76,38 @@ class owning_message_handle;  // completed below (057 byte-storage handle)
 namespace detail {
 // 057 construction seam (research D-2 / contract C-2): the SOLE hand-written
 // factory that mints an owning_message_handle. Declared here; DEFINED
-// out-of-line in reify.cpp — the handle is a heap pimpl, so the factory needs
+// out-of-line in reify.cpp — the handle is a pimpl, so the factory needs
 // the complete impl type and cannot be inline in this header.
 // owning_message_handle `friend`s this ONE stable name to reach its private
 // ctor/storage (passkey/attorney pattern). Deep-copies view.bytes() into mr;
-// std::bad_alloc -> dict_reify_oom. Called by the generated dispatch functions
-// in the build-tree bridge TU (and by reify()). NOT a user construction
-// surface — "handles come only from reify()" (FR-012: no C-ABI / public-builder
-// surface added).
+// std::bad_alloc during construction -> dict_reify_oom. Called by the
+// generated dispatch functions in the build-tree bridge TU (and by reify()).
+// NOT a user construction surface — "handles come only from reify()"
+// (FR-012: no C-ABI / public-builder surface added).
+//
+// fixpp#458 (090-capi-refusals) D-4: materialises the returned handle's view
+// EAGERLY (moved out of owning_message_handle::view()'s former lazy
+// build-on-first-call) and its documented failure set grows by ONE class: a
+// dict-backed source whose re-parse of the copied frame fails now returns
+// the wire error that re-parse produced, through this SAME channel, with no
+// handle constructed (contracts/msg-clone.md §9 / EC-8). A framing failure,
+// a framed-but-empty span, and a dict-free view's degraded OffsetTable build
+// are all RETAINED exactly as they behaved before — none of them refuses.
 [[nodiscard]] core::expected_t<owning_message_handle> owning_message_handle_from_frame(
     resolved_message_version rmv, wire::MessageView<wire::access_mode::Index> const& view,
     std::pmr::memory_resource* mr) noexcept;
 }  // namespace detail
 
 // 057: owning byte-storage message handle (runtime-dispatch return of
-// dict::reify()). Move-only, heap pimpl. The impl stores
-// {resolved_message_version, std::pmr::vector<std::byte> deep-copied frame,
-// lazily re-framed MessageView cache} — NOT type-erased, because the entire
-// in-scope surface (version()/msg_type()/view()/field_value()) is untyped.
+// dict::reify()). Move-only pimpl. fixpp#495 D-1c
+// (`.specify/495-493-486-dict-reify-copy.md` §2.5): the impl is allocated from
+// the `mr` passed to the minting factory, not the global heap. So `mr`, and the
+// storage it handed out, must stay valid until the handle is DESTROYED:
+// destruction reads the impl from that storage and deallocates into `mr` (do
+// not `release()` a monotonic `mr` while a handle minted from it is alive).
+// The impl (`owning_message_handle::impl` in src/dictionary/reify.cpp) holds
+// byte storage — NOT type-erased, because the entire in-scope surface
+// (version()/msg_type()/view()/field_value()) is untyped.
 // as<Msg>() remains AC-R6/T059-deferred; the byte storage does not foreclose a
 // future lazily-populated owner-cache (research D-2).
 class owning_message_handle {
@@ -110,6 +124,10 @@ public:
 
     [[nodiscard]] resolved_message_version version() const noexcept;  // AC-R6
     [[nodiscard]] std::string_view msg_type() const noexcept [[clang::lifetimebound]];
+    // fixpp#458 D-4: a pre-populated cache, seated by the minting factory
+    // before this handle is returned — NOT a cache this accessor validates.
+    // The observable on a span that frames to nothing is unchanged: an empty
+    // view, seated exactly as before.
     [[nodiscard]] wire::MessageView<wire::access_mode::Index> const& view() const noexcept
         [[clang::lifetimebound]];
     [[nodiscard]] core::expected_t<wire::field_view> field_value(std::uint16_t tag) const noexcept
@@ -125,8 +143,9 @@ public:
     [[nodiscard]] auto as() const noexcept [[clang::lifetimebound]] -> owning_message_t<Msg> const*;
 
 private:
-    struct impl;  // 057: heap pimpl holding {version, bytes_, view_cache_}.
-                  // Byte-storage (not SBO/polymorphic); as<Msg>() stays T059.
+    struct impl;  // Allocated from the factory's `mr` (fixpp#495 D-1c; see the
+                  // class comment). Byte-storage (not SBO/polymorphic); as<Msg>()
+                  // stays T059.
     explicit owning_message_handle(impl* p) noexcept : pimpl_(p) {}
     // The single friended construction seam (research D-2 / contract C-2).
     friend core::expected_t<owning_message_handle> detail::owning_message_handle_from_frame(
@@ -172,6 +191,9 @@ template <class Msg>
 //   dict_unknown_appl_ver_id, dict_unresolved_application_version (NOT a
 //   sentinel fall-through — RC#1), dict_reify_unknown_msg_type (resolved
 //   version+MsgType has no codegen owner, e.g. runtime-XML-only version).
+//   fixpp#458 D-4: plus, propagated from owning_message_handle_from_frame,
+//   the wire error a failed DICT-BACKED re-parse produced (EC-8) — a
+//   condition, not a closed additional enumerator list.
 [[nodiscard]] core::expected_t<owning_message_handle> reify(
     wire::MessageView<wire::access_mode::Index> const& view, version_profile profile,
     std::pmr::memory_resource* mr) noexcept;

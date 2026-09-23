@@ -24,6 +24,7 @@
 
 #include "support/context_group_delim_fn.hpp"
 #include "support/context_group_member_fn.hpp"
+#include "support/dict_hooks_test_access.hpp"
 #include "support/expired_parser_parse.hpp"
 #include "support/frame_view_factory.hpp"
 #include "support/mock_dict_table.hpp"
@@ -32,6 +33,8 @@ namespace {
 
 using fixpp::core::error;
 using fixpp::wire::access_mode;
+using fixpp::wire::dict_hooks;
+using fixpp::wire::dict_hooks_test_access;
 using fixpp::wire::OffsetTable;
 
 // Co-located shape invariant ([2b §4.4]) — the cutover-load-bearing layout.
@@ -148,14 +151,15 @@ TEST(WireOffsetTable, GroupBoundedUnderDefaultCap) {
     // "> 0 and <= cap" — the trailing 10= checksum entry is excluded by
     // membership, which is the property #220 turned on for every caller that
     // can be told what a member is.
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
         .add_valid("D", 447)
         .set_group_first(453, 448)
         .add_group_member(453, 447);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     auto buf = make_raw_frame(
         "35=D\x01"
@@ -187,14 +191,15 @@ TEST(WireOffsetTable, GroupBoundedUnderDefaultCap) {
 }
 
 TEST(WireOffsetTable, DoSCapPerInstanceAllowsAggregateOverCap) {
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
         .add_valid("D", 447)
         .set_group_first(453, 448)
         .add_group_member(453, 447);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     auto buf = make_raw_frame(
         "35=D\x01"
@@ -219,8 +224,8 @@ TEST(WireOffsetTable, DoSCapPerInstanceAllowsAggregateOverCap) {
 }
 
 TEST(WireOffsetTable, DoSCapPerInstanceRejectsOversizedSingleInstance) {
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
@@ -231,6 +236,7 @@ TEST(WireOffsetTable, DoSCapPerInstanceRejectsOversizedSingleInstance) {
         .add_group_member(453, 447)
         .add_group_member(453, 452)
         .add_group_member(453, 802);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     auto buf = make_raw_frame(
         "35=D\x01"
@@ -288,8 +294,9 @@ std::vector<std::byte> group_with_trailing_field_frame() {
 }
 
 // Membership for the frame above: 453 is a real group, delimiter 448.
-void fill_group_with_trailing_field_dict(fixpp::dict::table_view& dict) {
-    dict.add_valid("D", 35)
+fixpp::dict::table_view group_with_trailing_field_dict() {
+    fixpp::dict::table_view_builder b;
+    b.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
@@ -300,6 +307,7 @@ void fill_group_with_trailing_field_dict(fixpp::dict::table_view& dict) {
         .add_group_member(453, 447)
         .add_group_member(453, 452)
         .add_group_member(453, 802);
+    return std::move(b).build();
 }
 
 // PATH: opaque_dict_ == nullptr, DEFAULT Config.
@@ -361,16 +369,20 @@ TEST(WireOffsetTable, DictFreeGroupDeclinesWhenMembershipFnMissing) {
     auto fv = fixpp::wire::test::make_frame_view(buf);
     ASSERT_TRUE(fv.has_value());
 
-    fixpp::dict::table_view dict;
-    fill_group_with_trailing_field_dict(dict);
+    auto const dict = group_with_trailing_field_dict();
 
     std::pmr::monotonic_buffer_resource arena;
-    // 384: the delimiter oracle is spelled out too, now that it has no default.
-    // It is deliberately null here — the point of this cell is a table with no
-    // MEMBERSHIP oracle, which group() declines before any delimiter is
-    // resolved, so a threaded delimiter callback would never be called.
-    OffsetTable t{*fv, &arena, &dict, /*group_member_fn=*/nullptr,
-                  /*group_delim_fn=*/nullptr};
+    // 384 / fixpp#426: the delimiter oracle is spelled out too, now that it
+    // has no default. It is deliberately null here — the point of this cell
+    // is a table with no MEMBERSHIP oracle, which group() declines before any
+    // delimiter is resolved, so a threaded delimiter callback would never be
+    // called. dict_hooks_test_access::make builds the half-threaded bundle
+    // production code cannot spell (dict_hooks::for_table_view fills every
+    // field together).
+    OffsetTable t{*fv, &arena,
+                  dict_hooks_test_access::make(&dict, /*classify=*/nullptr,
+                                               /*group_member=*/nullptr, /*group_delim=*/nullptr,
+                                               /*length_pair=*/nullptr)};
     ASSERT_TRUE(t.build_status().has_value());
     ASSERT_TRUE(t.find(453).has_value())
         << "anti-vacuity: see DictFreeGroupDeclinesUnderDefaultConfig";
@@ -415,8 +427,7 @@ TEST(WireOffsetTable, TrailingFieldNotCountedIntoLastInstance) {
     auto fv = fixpp::wire::test::make_frame_view(buf);
     ASSERT_TRUE(fv.has_value());
 
-    fixpp::dict::table_view dict;
-    fill_group_with_trailing_field_dict(dict);
+    auto const dict = group_with_trailing_field_dict();
 
     // ARM 1 — cap 4: the old measure (5) breached, the membership measure (4)
     // does not. This is the false rejection #220 reported.
@@ -467,14 +478,15 @@ TEST(WireOffsetTable, GroupSliceStartsAtTagEquals) {
     // 220: DICT-AWARE construction — group_slices() derives its boundary from
     // group(), which is now a dictionary-only operation. The property under
     // test (a slice starts at "tag=", not at the value) is unchanged by that.
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
         .add_valid("D", 447)
         .set_group_first(453, 448)
         .add_group_member(453, 447);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     std::pmr::monotonic_buffer_resource arena;
     auto mv = fixpp::wire::test::parse_with_expired_parser(dict, *fv, &arena);
@@ -498,8 +510,8 @@ TEST(WireOffsetTable, GroupSliceStartsAtTagEquals) {
 }
 
 TEST(WireOffsetTable, GroupExtentExcludesTrailingTopLevelFields) {
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 55)
         .add_valid("D", 453)
@@ -507,6 +519,7 @@ TEST(WireOffsetTable, GroupExtentExcludesTrailingTopLevelFields) {
         .add_valid("D", 447)
         .set_group_first(453, 448)
         .add_group_member(453, 447);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     auto buf = make_raw_frame(
         "35=D\x01"
@@ -567,8 +580,8 @@ TEST(WireOffsetTable, GroupExtentExcludesTrailingTopLevelFields) {
 // old mutation is gone; the mutation that makes this RED is putting both groups
 // back into one shared growable vector.
 TEST(WireOffsetTable, TwoTopLevelGroupsSpanStableAcrossReads) {
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
@@ -580,6 +593,7 @@ TEST(WireOffsetTable, TwoTopLevelGroupsSpanStableAcrossReads) {
         .add_group_member(453, 447)
         .set_group_first(555, 600)
         .add_group_member(555, 624);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     // Two top-level groups: NoPartyIDs(453)=2 then NoLegs(555)=3.
     auto buf = make_raw_frame(
@@ -642,18 +656,19 @@ TEST(WireOffsetTable, TwoTopLevelGroupsSpanStableAcrossReads) {
 }
 
 TEST(WireOffsetTable, GroupExtentSupportsMoreThanThirtyTwoDistinctMembers) {
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 9000)
         .add_valid("D", 9999)
         .set_group_first(9000, 9001);
     for (std::uint16_t tag = 9001; tag <= 9033; ++tag) {
-        dict.add_valid("D", tag);
+        dictb.add_valid("D", tag);
         if (tag != 9001) {
-            dict.add_group_member(9000, tag);
+            dictb.add_group_member(9000, tag);
         }
     }
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     std::string body =
         "35=D\x01"
@@ -885,14 +900,15 @@ TEST(WireOffsetTable, GroupSlicesKeepsWireDelimiterWhenDelimStoreAnswersZero) {
     ASSERT_TRUE(fv.has_value());
 
     // Members registered; NO first-field record for 453.
-    fixpp::dict::table_view dict;
-    dict.add_valid("D", 35)
+    fixpp::dict::table_view_builder dictb;
+    dictb.add_valid("D", 35)
         .add_valid("D", 34)
         .add_valid("D", 453)
         .add_valid("D", 448)
         .add_valid("D", 447)
         .add_group_member(453, 448)
         .add_group_member(453, 447);
+    fixpp::dict::table_view const dict = std::move(dictb).build();
 
     // ── Fixture preconditions, asserted rather than assumed ─────────────────
     // Asserted through the ORACLE THE ARM ACTUALLY CALLS, not through the bare
@@ -918,7 +934,9 @@ TEST(WireOffsetTable, GroupSlicesKeepsWireDelimiterWhenDelimStoreAnswersZero) {
     // `group_delim_fn_` entirely.
     {
         std::pmr::monotonic_buffer_resource arena;
-        OffsetTable t{*fv, &arena, &dict, member_fn, &wrong_group_delim};
+        OffsetTable t{*fv, &arena,
+                      dict_hooks_test_access::make(&dict, /*classify=*/nullptr, member_fn,
+                                                   &wrong_group_delim, /*length_pair=*/nullptr)};
         ASSERT_TRUE(t.build_status().has_value());
         auto const slices = t.group_slices(453);
         // The EXACT split, not `!= 2`. `EXPECT_NE(size, 2)` also holds at 0 and
@@ -939,7 +957,10 @@ TEST(WireOffsetTable, GroupSlicesKeepsWireDelimiterWhenDelimStoreAnswersZero) {
     // ── THE ARM: a zero answer leaves the wire-derived delimiter in place ───
     {
         std::pmr::monotonic_buffer_resource arena;
-        OffsetTable t{*fv, &arena, &dict, member_fn, &fixpp_test_support::context_group_delim_fn};
+        OffsetTable t{*fv, &arena,
+                      dict_hooks_test_access::make(&dict, /*classify=*/nullptr, member_fn,
+                                                   &fixpp_test_support::context_group_delim_fn,
+                                                   /*length_pair=*/nullptr)};
         ASSERT_TRUE(t.build_status().has_value());
         auto const slices = t.group_slices(453);
         EXPECT_EQ(slices.size(), 2U)
@@ -956,7 +977,10 @@ TEST(WireOffsetTable, GroupSlicesKeepsWireDelimiterWhenDelimStoreAnswersZero) {
     // offered as "threaded".
     {
         std::pmr::monotonic_buffer_resource arena;
-        OffsetTable t{*fv, &arena, &dict, member_fn, /*group_delim_fn=*/nullptr};
+        OffsetTable t{*fv, &arena,
+                      dict_hooks_test_access::make(&dict, /*classify=*/nullptr, member_fn,
+                                                   /*group_delim=*/nullptr,
+                                                   /*length_pair=*/nullptr)};
         ASSERT_TRUE(t.build_status().has_value());
         EXPECT_EQ(t.group_slices(453).size(), 2U)
             << "an explicit null oracle and a zero-answering one must agree — the equivalence "

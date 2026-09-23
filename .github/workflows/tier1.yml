@@ -392,9 +392,9 @@ jobs:
     # the standing `ccache statistics` step in that job is what would make a
     # silent regression visible.
     #
-    # ⚠️ The FIRST post-merge coverage run on main is COLD (~133 min): `save:` is
-    # push-only, so main holds no coverage entry until that run creates one.
-    # That is the change working, not failing.
+    # ⚠️ The FIRST post-merge run of each leg after #411 moved the cache to GHCR
+    # is COLD (coverage ~133 min): the tag does not exist until that run's seed
+    # step publishes it. That is the change working, not failing.
     env:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_C_COMPILER_LAUNCHER: ccache
@@ -402,8 +402,11 @@ jobs:
       # Keep the upstream compression level so stored-byte and transfer
       # measurements remain comparable with the issue's existing evidence.
       CCACHE_COMPRESSLEVEL: "5"
+      # The action used to supply `max-size: 2G`; without it ccache falls back
+      # to its 5 GB default and the seed would publish up to that per leg.
+      CCACHE_MAXSIZE: 2G
       # Keep ccache outside the checkout so source-cleanliness tests do not see
-      # the action's default .ccache directory as an untracked repo file.
+      # a .ccache directory as an untracked repo file.
       CCACHE_DIR: /tmp/fixpp-ccache-${{ matrix.preset }}
 
     strategy:
@@ -604,7 +607,7 @@ jobs:
         run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
 
       - name: Use BoringCache for the shared Tier 1 compiler cache
-        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
+        uses: boringcache/one@476c7df90bc1e7c2c4066aa7eb31cc057ef7f8d1 # v1.32.0
         with:
           working-directory: .boringcache-plan
           trust-policy: auto
@@ -819,12 +822,77 @@ jobs:
           echo "OK: FIXPP_CODEGEN_V44_FAMILIES=all (full v44 coverage verified) on ${{ matrix.preset }}"
 
       - name: Build
+        id: build
         run: |
           cmake --build --preset ${{ matrix.preset }}
           # #254 disk trend point 3 of 4. One line, no new step; the operative
           # high-water mark is the job-end pair, because the consumer witness,
           # the packaging tier and `fixpp-package` all land AFTER this.
           df -h "$GITHUB_WORKSPACE" | tail -1
+
+      # ── ccache statistics — liveness, NO hit floor (owner, 2026-09-16) ───────
+      #
+      # Argument 2 (the restore disposition) is deliberately EMPTY, so the
+      # script asserts liveness only and ci/assert-ccache-floor-callers.py sees
+      # a lane with no floor. The owner chose no floor for Tier 1 when these
+      # legs moved to GHCR: the floor is fatal on a restore HIT below the bound,
+      # and a PR that edits a widely included header or a global flag restores
+      # main's HIT and falls under it — Tier 3 went red at 54 % on PR #453 and
+      # was only cured by deleting the tags. Across six matrix legs plus
+      # coverage that red would be routine. The cost, stated: the non-fatal
+      # "restore HIT with a near-zero rate" warning is gated on the same
+      # argument and does not print here either.
+      #
+      # ⛔ DO NOT pass `${{ steps.ccache_restore.outputs.hit }}` WITHOUT A FLOOR:
+      # assert-ccache-floor-callers.py refuses a traceable disposition with no
+      # floor (#299). Adding the floor is an owner decision, not a tidy-up.
+      #
+      # `id: ccache_stats` feeds the seed's `changed` guard; `if: always()` so a
+      # red build still reports its counters.
+      - name: ccache statistics
+        id: ccache_stats
+        if: always()
+        run: ci/ccache-stats.sh ${{ matrix.preset }} '' '${{ steps.build.outcome }}'
+
+      # #411 — trims the store to the files THIS run touched (dated by the
+      # `stats_zeroed_timestamp` restore-ccache.sh sets). The published archive
+      # holds what this run touched up to the seed; objects compiled after it —
+      # any nested sub-build a later test step runs — are not published and
+      # recompile on each run. Default `success()`: only a successful build
+      # trims. It sits BEFORE the seed because the seed publishes whatever the
+      # store holds; a trim after it would be runner-local and the untrimmed
+      # store would reach GHCR. Trimming changes which entries are kept, never
+      # an entry's bytes.
+      - name: Trim ccache to this run (#411)
+        run: ci/trim-ccache-to-run.sh ${{ matrix.preset }}
+
+      # Publish BEFORE the test steps: the cache is a compilation artifact, and
+      # withholding it on a red test would make the next run pay a cold build
+      # for an unrelated failure (same placement as tier3-libcxx.yml). Trade-off:
+      # this keeps a red test from withholding the library's cache, at the cost
+      # of the later objects described above never reaching GHCR.
+      #
+      # ⚠️ THE REF GUARD IS LOAD-BEARING. The ccache tag is coarse and ROLLING
+      # (ci/ccache-cache-key.sh), so every branch computes the SAME tag; a
+      # dispatch from a feature branch would overwrite what main reads next.
+      # `changed != '0'` skips republishing a store no compile wrote to
+      # (ccache's `local_storage_write`, not `misses` — see ci/ccache-stats.sh).
+      # An empty `changed` satisfies `!= '0'`, but here it can only come from a
+      # failed statistics step (`if: always()`, no `continue-on-error`, both
+      # pinned in ci/test-tier1-python-policy.sh), which fails the job, so
+      # Save's implicit `success()` skips it. Full rationale for `changed`
+      # itself at the sibling step in tier3-libcxx.yml.
+      - name: Save ccache to GHCR (push:main / dispatch on main, cache changed)
+        if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && steps.ccache_stats.outputs.changed != '0'
+        continue-on-error: true
+        env:
+          # Prune needs `delete:packages`, which GITHUB_TOKEN does not carry.
+          # With GHCR_PAT it reclaims the untagged version each republish
+          # orphans; without it the backlog is reported in the job summary.
+          GH_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          ci/seed-ccache.sh ${{ matrix.preset }}
 
       # 087 T024 / FR-014 / SC-008 — the LAST GATE-CLOSABLE VACUITY PATH.
       #
@@ -856,6 +924,78 @@ jobs:
             echo "::error::consumer label registered ${n:-0} tests, expected ${expected}."
             echo "::error::The 086/087 installed-interface gate is not registered on this lane."
             echo "::error::Refusing to report this lane green on an unrun gate."
+            exit 1
+          fi
+
+      # ── fixpp#448: the allocation-discipline gates, which NO CI lane ran ─────
+      #
+      # `grep -rn mallocnesia .github/` returned nothing before this. The gates existed,
+      # were labelled, and were enforced only when someone ran them by hand on a machine
+      # that had hand-built the interceptor. A bug fix adding a malloc to a hot path
+      # merged green.
+      #
+      # linux-clang-release ONLY, and that is a property of the mechanism, not a budget
+      # decision: the interceptor is an LD_PRELOAD malloc interposer, which the sanitizer
+      # lanes cannot host (their own allocator re-enters these hooks), and Release is the
+      # build whose hot path the zero-allocation rule is actually about.
+      #
+      # ⚠️ TWO STEPS, and the first is NOT redundant with `--no-tests=error`. MEASURED:
+      # with the gates deliberately unregistered, `ctest -L mallocnesia --no-tests=error`
+      # exits 0 reporting "100% tests passed, 0 failed out of 1" — one label member
+      # (the static marker scan) is registered outside the helper and survives, so ctest
+      # finds a test and is satisfied while EIGHTEEN gates have silently vanished. A
+      # count-or-population assertion is the only thing that sees that.
+      - name: "Assert the mallocnesia gate population (#448)"
+        id: mallocnesia_population
+        if: matrix.preset == 'linux-clang-release'
+        run: |
+          # ⚠️ --min-gates is a FLOOR and is deliberately brittle, exactly like the
+          # `-L consumer -N` / `-L packaging -N` pins a few steps above. The set rules
+          # in the checker are all satisfied by ONE surviving gate, so they cannot see a
+          # population that shrinks. Adding a gate does not need an edit here; removing
+          # one does, and that is the point.
+          python3 tools/check_mallocnesia_population.py \
+            --build-dir build/${{ matrix.preset }} --min-gates 20
+
+      # The gates themselves. No `|| true`, no continue-on-error: a real allocation on a
+      # gated hot path must fail this lane. `mallocnesia_positive_control` runs inside
+      # this same selection and is the arm that reddens if interception stops working —
+      # without it, "0 failed" is equally consistent with a clean tree and a dead
+      # interceptor, which is exactly the state this issue found on main.
+      - name: "Run the allocation-discipline gates (#448)"
+        id: mallocnesia_gates
+        if: matrix.preset == 'linux-clang-release'
+        run: ctest --preset ${{ matrix.preset }} -L mallocnesia --no-tests=error --output-on-failure
+
+      # ⚠️ THE STEPS ABOVE ARE GUARDED BY A STRING, AND A STRING CAN BE MISSPELLED.
+      # `if: matrix.preset == 'linux-clang-relese'` skips both on EVERY leg; the job then
+      # passes, the step-count pin still counts 39, and no allocation gate runs anywhere.
+      # A green job is not evidence a step ran — so this reads the steps' own OUTCOMES.
+      #
+      # It is deliberately UNGUARDED: a sentinel sharing the guard it is checking would be
+      # skipped by the same typo. On other legs it asserts the pair is `skipped`, which is
+      # what catches the inverse mistake of the gates silently running on a lane that
+      # cannot host the interposer.
+      - name: "Assert the allocation gates actually ran (#448)"
+        if: always()
+        run: |
+          set -euo pipefail
+          pop="${{ steps.mallocnesia_population.outcome }}"
+          gates="${{ steps.mallocnesia_gates.outcome }}"
+          echo "preset=${{ matrix.preset }} population=${pop:-<unset>} gates=${gates:-<unset>}"
+          if [ "${{ matrix.preset }}" = "linux-clang-release" ]; then
+            if [ "$pop" != "success" ] || [ "$gates" != "success" ]; then
+              echo "::error::the allocation gates did not run to success on the one lane"
+              echo "::error::that hosts them (population=$pop gates=$gates). If they were"
+              echo "::error::SKIPPED, the \`if:\` predicate no longer matches this preset —"
+              echo "::error::check its spelling. Refusing to report this lane green."
+              exit 1
+            fi
+          elif [ "$pop" != "skipped" ] || [ "$gates" != "skipped" ]; then
+            echo "::error::the allocation gates ran on ${{ matrix.preset }}, which is not"
+            echo "::error::linux-clang-release. Under a sanitizer the interceptor is"
+            echo "::error::outranked by the sanitizer's allocator and the gates pass"
+            echo "::error::VACUOUSLY, so running them here is worse than not running them."
             exit 1
           fi
 
@@ -896,6 +1036,82 @@ jobs:
             echo "::error::stopped being registered at all. Refusing to report this lane green either way."
             exit 1
           fi
+
+      # fixpp#431: a fast interop signal with its own name. This step runs on the
+      # cheapest non-sanitizer leg only, right after Build, so an interop break
+      # shows under this name before the long Test step.
+      #
+      # It closes two vacuity traps:
+      # - `ctest -L` exits 0 on an empty match, so the registered count is
+      #   asserted first, against ci/expected-interop-tests.txt.
+      # - ctest reports a gtest SKIP as a pass. So ci/assert-interop-skips.py
+      #   requires every skip to be listed in
+      #   tests/interop/expected-skips-without-counterparty.txt, and to give the
+      #   one allowed reason (no counterparty port leased).
+      #
+      # A Windows checkout (`core.autocrlf=true`) and native tool output may
+      # carry `\r`; both the ctest listing and the pin-file read are stripped of
+      # it before any line-anchored match, so this step's arithmetic does not
+      # depend on which OS produced either input.
+      #
+      # The pytest schema-check exclusion below is a `grep -v -x`, which is a
+      # silent no-op if the name it removes is absent — so its presence is
+      # asserted exactly once before it is used to derive the expected report
+      # count.
+      #
+      # Interop also runs again inside the unfiltered Test step below. That is
+      # intentional: that step is the coverage backstop, and this one is for
+      # speed and attribution.
+      - name: "Interop gate — ctest -L interop, skip set asserted (#431)"
+        if: matrix.preset == 'linux-clang-release'
+        run: |
+          set -euo pipefail
+          unset INTEROP_QUICKFIX_CPP_PORT INTEROP_QUICKFIX_J_PORT \
+                INTEROP_QUICKFIX_CPP_HOST INTEROP_QUICKFIX_J_HOST \
+                TESTBRIDGE_TEST_ONLY
+          # Inherited GTEST_* is cleared so the run is unfiltered; the checker
+          # compares each report against the binary's own enumeration.
+          unset "${!GTEST_@}"
+          if ! full=$(ctest --preset ${{ matrix.preset }} -L interop -N); then
+            echo "::error title=Interop gate::ctest -L interop -N failed on ${{ matrix.preset }}."
+            exit 1
+          fi
+          full="${full//$'\r'/}"
+          n=$(echo "$full" | sed -n 's/^Total Tests: //p')
+          expected=$(tr -d '\r' < ci/expected-interop-tests.txt \
+                       | awk -v p="${{ matrix.preset }}" '$1 == p { print $2; exit }')
+          echo "registered interop tests: ${n:-0} (expected ${expected:-<no line>})"
+          if [ -z "${expected:-}" ] || [ "${n:-0}" != "${expected}" ]; then
+            echo "::error title=Interop gate::ctest -L interop registered ${n:-0} tests on ${{ matrix.preset }}, expected '${expected:-<no line>}' from ci/expected-interop-tests.txt."
+            exit 1
+          fi
+
+          # interop_cell_results_schema_check is a pytest ctest entry (see
+          # tests/interop/CMakeLists.txt) — it never emits a gtest JSON report,
+          # so it is excluded before deriving how many reports to expect.
+          names_all=$(echo "$full" | sed -n 's/^ *Test *#[0-9]*: //p')
+          schema_hits=$(echo "$names_all" | grep -c -x 'interop_cell_results_schema_check' || true)
+          if [ "$schema_hits" != "1" ]; then
+            echo "::error title=Interop gate::interop_cell_results_schema_check registered ${schema_hits} time(s) on ${{ matrix.preset }}, expected exactly 1 — the pytest schema-check exclusion below would be a silent no-op (or would remove more than one entry)."
+            exit 1
+          fi
+          names=$(echo "$names_all" | grep -v -x 'interop_cell_results_schema_check')
+          binaries=$(echo "$names" | grep -c .)
+
+          out_dir="$RUNNER_TEMP/interop-gtest"
+          rm -rf "$out_dir" && mkdir -p "$out_dir"
+          if ! GTEST_OUTPUT="json:${out_dir}/" \
+            ctest --preset ${{ matrix.preset }} -L interop --no-tests=error \
+                  --output-on-failure --timeout 1800; then
+            echo "::error title=Interop gate::ctest -L interop failed on ${{ matrix.preset }}."
+            exit 1
+          fi
+
+          python3 ci/assert-interop-skips.py \
+            --json-dir "$out_dir" \
+            --bin-dir "build/${{ matrix.preset }}/bin" \
+            --expected-skips tests/interop/expected-skips-without-counterparty.txt \
+            --expected-count "$binaries"
 
       # 084 T067 / FR-026a — the packaging tier is GATED ON ONE LANE.
       #
@@ -1264,6 +1480,7 @@ jobs:
         continue-on-error: true
         run: cat /tmp/disk.txt >> "$GITHUB_STEP_SUMMARY"
 
+
   # ── Coverage job (SOFT — does not fail on threshold; Phase 3) ────────────
   # SOFT GATE: coverage threshold enforcement is disabled until Phase 4 module 1
   # closes per [const §IX.1] and the deliverables note in Step 4.
@@ -1312,6 +1529,7 @@ jobs:
       CCACHE_COMPILERCHECK: content
       CCACHE_COMPRESSLEVEL: "5"
       CCACHE_DIR: /tmp/fixpp-ccache-linux-clang-coverage
+      CCACHE_MAXSIZE: 2G   # see the `linux` job — the action used to supply it
 
     steps:
       - uses: actions/checkout@v6
@@ -1436,7 +1654,7 @@ jobs:
         run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
 
       - name: Use BoringCache for the shared Tier 1 compiler cache
-        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
+        uses: boringcache/one@476c7df90bc1e7c2c4066aa7eb31cc057ef7f8d1 # v1.32.0
         with:
           working-directory: .boringcache-plan
           trust-policy: auto
@@ -1451,6 +1669,22 @@ jobs:
       - name: Restore Conan cache from GHCR
         id: conan_restore
         run: ci/restore-conan-cache.sh linux-clang-coverage
+
+      # Compiler cache on GHCR (#411) — same steps and ordering constraint as
+      # the `linux` job; see the note there. ccache must be on PATH before
+      # "Conan install" (exit 127 otherwise), and the restore must precede any
+      # compile through the launcher.
+      - name: Install ccache
+        run: |
+          set -euo pipefail
+          ci/apt-guard.sh apt-install -- sudo apt-get install -y --no-install-recommends ccache
+          ccache --version
+
+      - name: Restore ccache from GHCR
+        id: ccache_restore
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          ci/restore-ccache.sh linux-clang-coverage
 
       - name: Conan install
         run: |
@@ -1509,7 +1743,49 @@ jobs:
       # action summary separately reports the preflight disposition and native
       # ccache counters for this run.
       - name: ccache statistics
+        id: ccache_stats
+        if: always()
         run: ci/ccache-stats.sh linux-clang-coverage '' '${{ steps.build.outcome }}'
+
+      # #411 — trims the store to the files THIS run touched (dated by the
+      # `stats_zeroed_timestamp` restore-ccache.sh sets). The published archive
+      # holds what this run touched up to the seed; objects compiled after it —
+      # any nested sub-build a later test step runs — are not published and
+      # recompile on each run. Default `success()`: only a successful build
+      # trims. It sits BEFORE the seed because the seed publishes whatever the
+      # store holds; a trim after it would be runner-local and the untrimmed
+      # store would reach GHCR. Trimming changes which entries are kept, never
+      # an entry's bytes.
+      - name: Trim ccache to this run (#411)
+        run: ci/trim-ccache-to-run.sh linux-clang-coverage
+
+      # Publish BEFORE the test steps: the cache is a compilation artifact, and
+      # withholding it on a red test would make the next run pay a cold build
+      # for an unrelated failure (same placement as tier3-libcxx.yml). Trade-off:
+      # this keeps a red test from withholding the library's cache, at the cost
+      # of the later objects described above never reaching GHCR.
+      #
+      # ⚠️ THE REF GUARD IS LOAD-BEARING. The ccache tag is coarse and ROLLING
+      # (ci/ccache-cache-key.sh), so every branch computes the SAME tag; a
+      # dispatch from a feature branch would overwrite what main reads next.
+      # `changed != '0'` skips republishing a store no compile wrote to
+      # (ccache's `local_storage_write`, not `misses` — see ci/ccache-stats.sh).
+      # An empty `changed` satisfies `!= '0'`, but here it can only come from a
+      # failed statistics step (`if: always()`, no `continue-on-error`, both
+      # pinned in ci/test-tier1-python-policy.sh), which fails the job, so
+      # Save's implicit `success()` skips it. Full rationale for `changed`
+      # itself at the sibling step in tier3-libcxx.yml.
+      - name: Save ccache to GHCR (push:main / dispatch on main, cache changed)
+        if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && steps.ccache_stats.outputs.changed != '0'
+        continue-on-error: true
+        env:
+          # Prune needs `delete:packages`, which GITHUB_TOKEN does not carry.
+          # With GHCR_PAT it reclaims the untagged version each republish
+          # orphans; without it the backlog is reported in the job summary.
+          GH_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          ci/seed-ccache.sh linux-clang-coverage
 
       # Wrapped by the #266 peak-RSS instrument for the same reason as the matrix
       # legs — see the `Peak memory` step in the `linux` job. The coverage lane
@@ -1604,6 +1880,7 @@ jobs:
           flags: unittests
           disable_search: true   # prevent auto-discovery of .ddi/.modmap CMake artefacts
           fail_ci_if_error: false  # SOFT: keep consistent with other coverage steps
+
 
   # ── Python wheel gate (PY-005 / 056) ─────────────────────────────────────
   # ADDITIVE (CI-8): this does NOT touch the python tests on the `linux` matrix
@@ -1798,7 +2075,7 @@ jobs:
 
       - name: Restore the wheel ccache from BoringCache
         id: ccache_restore
-        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
+        uses: boringcache/one@476c7df90bc1e7c2c4066aa7eb31cc057ef7f8d1 # v1.32.0
         with:
           working-directory: .boringcache-plan
           trust-policy: auto
@@ -2383,6 +2660,39 @@ jobs:
       - name: "Regression pin — #289 site-label uniqueness"
         run: bash ci/pump-label-uniqueness.sh
 
+      # fixpp#468: ci/run-interop-live.py REFUSES to run the live-interop job when it
+      # cannot account for the whole #431 population. Every one of those refusals is
+      # pinned here by a mutant, each asserted to produce its OWN message rather than
+      # merely a non-zero exit — which any typo also produces. The driver is the only
+      # thing standing between "the live job is green" and "the live job ran the cells
+      # it claims to", so an unexercised refusal in it would be the exact defect class
+      # it exists to catch.
+      #
+      # ⚠️ BOUND, because an earlier revision of this comment overstated it: T0 runs the
+      # driver's OFFLINE checks against the real files, so it proves the driver says yes
+      # to the tree we ship for the half that needs no image. The covered∪excluded
+      # equality needs the image's registry and runs only in the interop-live job.
+      # Buildless — python3 + coreutils only.
+      - name: "Regression pin — interop-live population reconciliation (#468)"
+        run: bash ci/test-run-interop-live.sh
+
+      # fixpp#448: the allocation gates are selected by LABEL, and on main that label
+      # picked 8 of 18 real gates — silently, because a label selecting 8 real tests
+      # still runs 8 real tests and they pass. tools/check_mallocnesia_population.py is
+      # what sees that; this pins its branches with a mutant each.
+      # Buildless — synthetic CTestTestfile.cmake fixtures, no configured tree needed
+      # (its T0 arm reconciles the REAL population when one happens to be present).
+      - name: "Regression pin — mallocnesia gate population (#448)"
+        run: bash ci/test-mallocnesia-population.sh
+
+      # fixpp#448: check_alloc.py carries the fail-closed refusal, the interception
+      # witness and the positive control's inverted verdict — the heart of the change,
+      # and every one of them is a refusal nobody had seen fire. Self-contained: the
+      # harness builds the real interceptor and its own subject binaries with cc, so it
+      # needs no configured tree.
+      - name: "Regression pin — check_alloc refusals (#448)"
+        run: bash ci/test-check-alloc.sh
+
       # #289 batch 18: a fixed `run_for` staging a MOCK-CLOCK advance is a
       # wall-clock hope, and a starved runner turns it into a LOST advance --
       # unrecoverable, not slow. The sweep REPORTS candidates and exits 0; what
@@ -2407,6 +2717,22 @@ jobs:
       # — bash + coreutils, no real disk, no /proc reads (both overridden).
       - name: "Regression pin — 089 disk-preflight gate (D-1..D-11, spurious-hit arms)"
         run: bash ci/test-disk-preflight.sh
+
+      # fixpp#431's checker, ci/assert-interop-skips.py: reads a gtest JSON
+      # dir and asserts no case failed, the SKIPPED set matches the checked-in
+      # list exactly (both directions), every skip gives the one allowed
+      # reason. Fixture cells only, no ctest, no build.
+      - name: "Regression pin — interop skip-set witness escapes (#431)"
+        run: bash ci/test-interop-skips.sh
+
+      # fixpp#431 Gate B r1: EXECUTES the interop gate step's own extracted
+      # `run:` text against a fake ctest, so the CR-normalisation and
+      # exactly-once schema-check exclusion the step's shell carries are
+      # regression-pinned by running the code, not by grepping for it. The
+      # static leg-guard/continue-on-error/label/pin-read/checker-call shape
+      # is pinned separately by ci/assert-ci-lane-policy.py.
+      - name: "Regression pin — interop gate step shell derivation (#431)"
+        run: bash ci/test-interop-gate-step.sh
 
       # ci/cxx_blank.py is the SHARED lexer three of the gates above resolve at
       # runtime, and #289 batch 19 moved `blank_unevaluated` into it and replaced
@@ -2783,6 +3109,7 @@ jobs:
       # BoringCache's remote namespace does not derive its identity from this
       # path; ccache derives object identity from the compiler invocation.
       CCACHE_DIR: /tmp/fixpp-ccache-linux-clang-release
+      CCACHE_MAXSIZE: 2G
 
     steps:
       # fetch-depth: 0 — #209 tier 2 needs the MERGE-BASE commit present locally
@@ -2877,8 +3204,7 @@ jobs:
       # It has no writer capability, deliberately (#273).
       #
       # It used to key on `tier1-bench` and save on push:main. MEASURED on PR
-      # #279's run 32146773220, where both jobs started at the same second on the
-      # same runner pool and built the SAME preset:
+      # #279's run 32146773220, where both jobs built the SAME preset:
       #
       #   linux-clang-release (matrix)   8m36s   ccache 1599/1636 hits (97.74%)
       #   bench (soft)                 2h00m37s  ccache   15/1616 hits ( 0.93%)
@@ -2942,7 +3268,7 @@ jobs:
         run: printf '%s\n' '/.boringcache-plan/' >> .git/info/exclude
 
       - name: Restore the shared Tier 1 compiler cache through BoringCache
-        uses: boringcache/one@1039999c65011be670f5655e0e48ad556188ab12 # v1.30.4
+        uses: boringcache/one@476c7df90bc1e7c2c4066aa7eb31cc057ef7f8d1 # v1.32.0
         with:
           working-directory: .boringcache-plan
           trust-policy: restore

@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // clang-format off
@@ -53,6 +54,18 @@ static_assert(
     std::is_constructible_v<fixpp::wire::dictionary_driven_validator, fixpp::dict::table_view>,
     "[2b §6.5] must be explicitly constructible from dict::table_view by value");
 
+// fixpp#486 (`.specify/495-493-486-dict-reify-copy.md` §5, T-1): the constructor's
+// OWN exception specification equals table_view's move specification. The argument
+// is a prvalue from a noexcept function, so guaranteed elision initialises the
+// by-value parameter with no move and the noexcept operator sees only the
+// constructor's specification (a table_view&& argument would also count the
+// caller-side move, which makes the equality hold on every toolchain). On MSVC,
+// where table_view's move can allocate, the unfixed `noexcept` makes this fire.
+using t1_tv_factory = fixpp::dict::table_view (&)() noexcept;
+static_assert(noexcept(fixpp::wire::dictionary_driven_validator{std::declval<t1_tv_factory>()()}) ==
+                  std::is_nothrow_move_constructible_v<fixpp::dict::table_view>,
+              "fixpp#486: dictionary_driven_validator's noexcept must follow table_view's move");
+
 // table_view is held BY VALUE (SC-007: no virtual edge). It must be
 // copy-constructible so dictionary_driven_validator can store a local copy.
 static_assert(std::is_copy_constructible_v<fixpp::dict::table_view>,
@@ -75,6 +88,7 @@ namespace {
 using fixpp::core::error;
 using fixpp::dict::field_type;
 using fixpp::dict::table_view;
+using fixpp::dict::table_view_builder;
 using fixpp::wire::access_mode;
 using fixpp::wire::dictionary_driven_validator;
 using fixpp::wire::MessageView;
@@ -133,9 +147,9 @@ MessageView<access_mode::Index> parse_index(std::vector<std::byte> const& buf,
 //   tag 54 (Side) is enumerated: allowed values "1" (Buy) and "2" (Sell)
 //   tag 453 starts a repeating group; first field is 448 (PartyID)
 table_view make_d_grammar() {
-    table_view t;
+    table_view_builder tb;
     // Header fields (always required/valid for every message)
-    t.add_required("D", 8)      // BeginString
+    tb.add_required("D", 8)     // BeginString
         .add_required("D", 9)   // BodyLength
         .add_required("D", 35)  // MsgType
         .add_required("D", 49)  // SenderCompID
@@ -162,7 +176,7 @@ table_view make_d_grammar() {
         // repeating group: tag 453 (NoPartyIDs), first delimiter is tag 448
         .set_group_first(453, 448)
         .add_group_member(453, 447);
-    return t;
+    return std::move(tb).build();
 }
 
 // ── Scratch arena for validator calls (≤ 600 B working set per spec). ─────────
@@ -437,8 +451,8 @@ TEST(ValidatorDomain, GroupThenTopLevelFieldNotOverCounted) {
 }
 
 TEST(ValidatorDomain, TrailingTopLevelFieldSharingMemberTagIsNotAbsorbed) {
-    table_view gram;
-    gram.add_required("D", 8)
+    table_view_builder gramb;
+    gramb.add_required("D", 8)
         .add_required("D", 9)
         .add_required("D", 35)
         .add_required("D", 49)
@@ -456,8 +470,7 @@ TEST(ValidatorDomain, TrailingTopLevelFieldSharingMemberTagIsNotAbsorbed) {
         .set_type(54, field_type::Char)
         .add_enum(54, "1")
         .add_enum(54, "2");
-
-    dictionary_driven_validator v{std::move(gram)};
+    dictionary_driven_validator v{std::move(gramb).build()};
 
     auto buf = make_frame(
         "35=D\x01"
@@ -496,8 +509,8 @@ TEST(ValidatorDomain, NestedMalformedGroupRejected) {
     //     447 (PartyIDSource) — a member
     //     460 (NoRelationships, delimiter=461) — inner group count
     //     461 (Relationship) — inner group delimiter/member
-    table_view gram;
-    gram.add_required("D", 8)
+    table_view_builder gramb;
+    gramb.add_required("D", 8)
         .add_required("D", 9)
         .add_required("D", 35)
         .add_required("D", 49)
@@ -521,8 +534,7 @@ TEST(ValidatorDomain, NestedMalformedGroupRejected) {
         .set_type(54, field_type::Char)
         .add_enum(54, "1")
         .add_enum(54, "2");
-
-    dictionary_driven_validator v{std::move(gram)};
+    dictionary_driven_validator v{std::move(gramb).build()};
 
     // Outer 453=1 (1 instance), inner 460=2 declares 2 but only 1 follows.
     auto buf = make_frame(

@@ -42,16 +42,21 @@ G1 enriches the live session-admin cells to assert **real bidirectional FIX 4.4
 session-admin traffic on the established session** (beyond the Logon/Logout
 handshake the 016 cells captured). **QuickFIX-J only** at v1.0 G1; **both fixpp
 roles**. Goldens compared under the explicit `{52,10}` admin profile (NOT the
-016 default — it would drop `112`/`34`/`122`/`123`). Per-cell completeness:
+016 default — it would drop `112`/`34`/`122`/`123`); the one exception is
+`recovery_inbound`, whose reply is a QFJ-generated GapFill carrying a
+wall-clock `122`, so it runs under `{52,10,122}` (fixpp#462). Per-cell completeness:
 every `(scenario_group × role)` present; each cell's `acceptance_ids` is the
 exact set for its group (descriptor rule 7/8). Goldens captured at first paired
-run (parent harness + live QFJ); absent ⇒ `skip:golden-not-yet-captured`.
+run (parent harness + live QFJ). #445: the diff itself runs in the parent
+harness's `_finalize`, against that same run's own capture, via
+`interop_golden_check --check verbatim-admin|verbatim-poss-dup` — fail-closed
+(missing/empty golden or capture ⇒ exit 2), not a gtest-side skip.
 
 | scenario_group | Driver | Cells (QFj × role) | acceptance_ids | spec_ref | Naming |
 |----------------|--------|--------------------|----------------|----------|--------|
 | `testrequest_echo` | `hp_fix44_testrequest_echo_test.cpp` (T007) | init/acc (2) | {US1-1, US1-2, US1-3} | [FIX-SL §4.5.5] | reuse-and-enrich `…-testrequest-echo` |
 | `idle_cadence` | `hp_fix44_idle_heartbeat_cadence_test.cpp` (T016) | init/acc (2) | {US2-1, US2-2} | [FIX-SL §4.5.1] | **new** `…-idle-cadence` |
-| `recovery_inbound` | `hp_fix44_seqnum_recovery_test.cpp` (T011) | init/acc (2) | {US3-1, US3-2, US3-4} | [FIX-SL §4.8.2/§4.8.5/§4.5.3] | reuse-and-enrich `…-seqnum-recovery` |
+| `recovery_inbound` | `hp_fix44_seqnum_recovery_test.cpp` (T011) | init/acc (2) | {US3-1, US3-2, US3-4} | [FIX-SL §4.8.2/§4.8.5/§4.5.3] | **new** `…-recovery-inbound` (fixpp#462; the planned reuse of `…-seqnum-recovery` was not possible — a cell carries one counterparty environment, and the 016 smoke TEST_P in that binary is a witness only while the peer induces nothing) |
 | `recovery_outbound` | `hp_fix44_recovery_outbound_answer_test.cpp` (T012) | init/acc (2) | {US3-3, US3-4} | [FIX-SL §4.8.2/§4.8.5/§4.8.6] | **new** `…-recovery-outbound` |
 | `session_reject` | `hp_fix44_reject_invalid_admin_test.cpp` (T019) | init/acc (2) | {US4-1, US4-2} | [FIX-SL §4.5.4] | reuse-and-enrich `…-reject-invalid-admin` |
 
@@ -105,7 +110,9 @@ received-141 path (reset AFTER `check_inbound`). 1 scenario × `counterparty ∈
 | `happy/golden/RR-QFcpp-acc-fix44-received-reset.fix` | QFcpp acceptor T028 | peer 141=Y+34=1 Logon + fixpp reply (34=1, 789=2 if 027-on) + peer 34=2 accepted, NO fixpp 35=2 ResendRequest; admin profile {52,10} |
 | `happy/golden/RR-QFj-acc-fix44-received-reset.fix` | QFj acceptor T028 | peer 141=Y+34=1 Logon + fixpp reply + peer 34=2 accepted, NO fixpp ResendRequest; admin profile {52,10} |
 
-Golden absent → `skip:golden-not-yet-captured` (per `diff_golden_or_skip` convention).
+#445: the golden diff runs in the parent harness's `_finalize`, against that run's
+own capture, via `interop_golden_check --check verbatim-admin` — fail-closed
+(missing/empty golden or capture ⇒ exit 2), not a gtest-side skip. Goldens
 MUST NOT be hand-fabricated.
 
 **Parent-harness obligations for T016/T017:**

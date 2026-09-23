@@ -284,6 +284,10 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_group_get_nested_group(const fixpp_group_t*
  *    FIXPP_ERR_NULL_HANDLE    -- session or msg_out is NULL
  *    FIXPP_ERR_INVALID_HANDLE -- session is destroyed / engine is gone
  *    FIXPP_ERR_DICT_CONFIG    -- msg_type not found in the session dictionary
+ *    FIXPP_ERR_WIRE_CONFORMANCE -- msg_type is empty or holds SOH (0x01); a session
+ *                               with a dictionary reports DICT_CONFIG first.
+ *                               (1.6, BREAKING: a session without a dictionary
+ *                               used to accept it.)
  *
  *  Reentrancy: requires-session-lock
  */
@@ -307,10 +311,41 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_destroy(fixpp_msg_t* msg);
  *  liveness token (session close does NOT tombstone the clone).
  *  Clone reads (get, has_tag) are THREAD_SAFE.
  *
+ *  (1.7, BREAKING), two limbs:
+ *
+ *  Limb 1 -- a DICT-BACKED source whose re-parse of the copied frame fails
+ *  now REFUSES: no clone handle, *clone_out stays NULL, and the source
+ *  handle is unchanged and still usable. Before 1.7 this silently returned
+ *  FIXPP_ERR_OK with a dictionary-free clone. The code is the caller-visible
+ *  translation of the wire failure that caused the re-parse to fail; the
+ *  three routes reachable today are FIXPP_ERR_UNKNOWN (an out-of-memory
+ *  allocation failure -- documented v1.0 behaviour, see the live
+ *  spec/behaviors-and-limitations.md L-049-2), FIXPP_ERR_WIRE_LIMIT_EXCEEDED
+ *  (a capacity or tag-range failure), and FIXPP_ERR_WIRE_INVALID_FRAME (a
+ *  malformed field). This is not a closed list -- any future route added to
+ *  the engine's internal error translation reaches the caller the same way.
+ *
+ *  Limb 2 -- a non-allocation exception raised during clone's own
+ *  construction now terminates the process after a fatal log, instead of
+ *  returning FIXPP_ERR_CAPI_CONFIG_INVALID. Its trigger set is NOT
+ *  enumerated: whether such an exception can be produced on this path at
+ *  all is undecided; the behaviour change is declared regardless, because a
+ *  return becoming a process abort is observable on this symbol whatever
+ *  its reachability.
+ *
  *  Return codes:
- *    FIXPP_ERR_OK             -- success; *clone_out is live
- *    FIXPP_ERR_NULL_HANDLE    -- src or clone_out is NULL
- *    FIXPP_ERR_INVALID_HANDLE -- src is destroyed / tombstoned
+ *    FIXPP_ERR_OK                    -- success; *clone_out is live
+ *    FIXPP_ERR_NULL_HANDLE            -- src or clone_out is NULL
+ *    FIXPP_ERR_INVALID_HANDLE         -- src is destroyed / tombstoned, or is an
+ *                                        outbound accumulator handle (no wire view)
+ *    FIXPP_ERR_CAPI_CONFIG_INVALID    -- std::bad_alloc during clone construction
+ *                                        (preserved from before 1.7, narrowed)
+ *    FIXPP_ERR_UNKNOWN                -- (1.7, BREAKING) limb 1: dict-backed
+ *                                        re-parse failed, out-of-memory route
+ *    FIXPP_ERR_WIRE_LIMIT_EXCEEDED    -- (1.7, BREAKING) limb 1: dict-backed
+ *                                        re-parse failed, capacity/range route
+ *    FIXPP_ERR_WIRE_INVALID_FRAME     -- (1.7, BREAKING) limb 1: dict-backed
+ *                                        re-parse failed, malformed-field route
  *
  *  Reentrancy: requires-session-lock (on the source handle's owning session)
  */
@@ -328,6 +363,9 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_clone(const fixpp_msg_t* src, fixpp_msg
  *    FIXPP_ERR_INVALID_HANDLE            -- msg is destroyed / session closed
  *    FIXPP_ERR_MSG_FRAMING_TAG_FORBIDDEN -- tag is a framing tag
  *    FIXPP_ERR_DICT_CONFIG               -- tag not declared for this MsgType
+ *    FIXPP_ERR_WIRE_CONFORMANCE          -- (1.6, BREAKING) value holds SOH (0x01) and `tag` is not
+ *                                           the Data half of a Length+Data pair; nothing
+ *                                           is written
  *    (note: set_string is always-OK on any dict field type -- no TYPE_MISMATCH)
  *
  *  Reentrancy: requires-session-lock
@@ -337,11 +375,45 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_string(fixpp_msg_t* msg, uint16_t t
 
 /** Set a raw-bytes field (type-agnostic escape hatch for Data or extension tags).
  *  No dictionary type check; framing-tag check still applies.
+ *  Since 1.6, fixpp_msg_commit refuses a malformed Length+Data pair, or SOH outside a
+ *  Data value, whichever setter wrote the field. For a Data field prefer
+ *  fixpp_msg_set_data, which writes the Length too.
  *
  *  Reentrancy: requires-session-lock
  */
 FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_bytes(fixpp_msg_t* msg, uint16_t tag,
                                               const uint8_t* bytes, size_t len);
+
+/** Set a Length+Data pair (1.6). `data_tag` is the Data field; its Length field is
+ *  written from `len`.
+ *
+ *  The bytes are copied verbatim and may hold any value, SOH included: the Length
+ *  makes them framing-safe. The Length paired with `data_tag` comes from the FIX
+ *  standard or, for a pair the standard does not define, from the session's
+ *  dictionary.
+ *
+ *  With neither half present, appends the Length then the Data. With the Length
+ *  immediately followed by the Data, overwrites both in place. Any other state (one
+ *  half only, the halves apart, or the Data first) is refused and nothing is
+ *  written; remove the stray half first. No existing field moves, so open group
+ *  builders stay valid.
+ *
+ *  Return codes:
+ *    FIXPP_ERR_OK                        -- success
+ *    FIXPP_ERR_NULL_HANDLE               -- msg or bytes is NULL
+ *    FIXPP_ERR_INVALID_HANDLE            -- msg is destroyed / session closed
+ *    FIXPP_ERR_MSG_FRAMING_TAG_FORBIDDEN -- data_tag, or the Length tag the pair
+ *                                           gives it, is a framing tag
+ *    FIXPP_ERR_TYPE_MISMATCH             -- data_tag is not the Data half of a pair, a
+ *                                           half collides with a group, or the pair's
+ *                                           current state is not Length-then-Data
+ *    FIXPP_ERR_WIRE_CONFORMANCE          -- len is 0 (an empty Data value is malformed)
+ *    FIXPP_ERR_DICT_CONFIG               -- a half is not declared for this MsgType
+ *
+ *  Reentrancy: requires-session-lock
+ */
+FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_data(fixpp_msg_t* msg, uint16_t data_tag,
+                                             const uint8_t* bytes, size_t len);
 
 /** Set an integer field (serialised as ASCII decimal).
  *  Reentrancy: requires-session-lock
@@ -365,7 +437,24 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_double(fixpp_msg_t* msg, uint16_t t
 FIXPP_API_EXPORT fixpp_error_t fixpp_msg_set_decimal(fixpp_msg_t* msg, uint16_t tag,
                                                 fixpp_decimal_t value);
 
-/** Remove a tag from the accumulator.  Idempotent (absent returns OK).
+/** Remove a tag from the accumulator.
+ *
+ *  Idempotent (absent returns OK) ONLY when no group builder is open --
+ *  (1.7, BREAKING): an open builder holds an INDEX into `entries` (or a
+ *  parent instance's fields), and erasing shifts every later index, so the
+ *  call refuses instead of erasing while ANY group builder is open -- even
+ *  for the two classes that are individually harmless: an absent tag
+ *  (nothing would move) and a present tag positioned after every live
+ *  root's group entry (erase would not shift it). The refusal is keyed on
+ *  the builder stack being non-empty, not on the erased tag or its
+ *  position, so no tag choice defeats it.
+ *
+ *  Return codes:
+ *    FIXPP_ERR_OK              -- erased (or absent), no group builder open
+ *    FIXPP_ERR_NULL_HANDLE     -- msg is NULL
+ *    FIXPP_ERR_INVALID_HANDLE  -- msg is destroyed/inbound/session closed, or
+ *                                 (1.7, BREAKING) a group builder is open
+ *
  *  Reentrancy: requires-session-lock
  */
 FIXPP_API_EXPORT fixpp_error_t fixpp_msg_remove_tag(fixpp_msg_t* msg, uint16_t tag);
@@ -382,6 +471,13 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_remove_tag(fixpp_msg_t* msg, uint16_t t
  *    FIXPP_ERR_TYPE_MISMATCH   -- group grammar violated (empty instance or
  *                                 non-delimiter-first instance; INV-4)
  *    FIXPP_ERR_WIRE_LIMIT_EXCEEDED -- serialised body exceeds ~3800 B
+ *    FIXPP_ERR_WIRE_CONFORMANCE    -- (1.6, BREAKING) the output would be malformed, in any group
+ *                                     instance too: a Data field not immediately after
+ *                                     its Length, a Length not immediately before its
+ *                                     Data, a Length that is not positive ASCII digits
+ *                                     equal to the Data byte count (leading zeros are
+ *                                     accepted), an empty Data value, or SOH in a field
+ *                                     that is not a Data field
  *
  *  Reentrancy: requires-session-lock
  */
@@ -393,7 +489,7 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_commit(fixpp_msg_t* msg, const uint8_t*
  * Build a repeating group on an outbound accumulator:
  *   fixpp_msg_group_begin(msg, NoXxx, &builder)
  *   -> fixpp_group_builder_add_entry(builder, &entry) [per instance]
- *      -> fixpp_entry_set_{string,int,double,decimal}(entry, tag, …) [per field]
+ *      -> fixpp_entry_set_{string,int,double,decimal,data}(entry, tag, …) [per field]
  *      -> fixpp_entry_group_begin(entry, NoYyy, &nested) [optional nested group]
  *   -> fixpp_msg_group_end(msg, builder)
  *
@@ -414,29 +510,63 @@ FIXPP_API_EXPORT fixpp_error_t fixpp_msg_group_begin(fixpp_msg_t* msg, uint16_t 
                                                 fixpp_group_builder_t** builder_out);
 
 /** Append a new entry (group instance) to `builder`; returns a writable entry.
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the builder's
+ *  resolved group index is out of range for the container it names.
  *  Reentrancy: requires-session-lock */
 FIXPP_API_EXPORT fixpp_error_t fixpp_group_builder_add_entry(fixpp_group_builder_t* builder,
                                                        fixpp_entry_t** entry_out);
 
 /** Set a STRING field on the current entry. Framing tags → MSG_FRAMING_TAG_FORBIDDEN.
+ *  Since 1.6 (BREAKING), a value holding SOH (0x01) on a tag that is not the Data half of a
+ *  Length+Data pair → FIXPP_ERR_WIRE_CONFORMANCE, nothing written.
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the entry's
+ *  resolved group instance index is out of range.
  *  Reentrancy: requires-session-lock */
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_string(fixpp_entry_t* entry, uint16_t tag,
                                                  const char* value, size_t len);
 
-/** Set an INTEGER field on the current entry. Reentrancy: requires-session-lock */
+/** Set a Length+Data pair on the current entry (1.6): fixpp_msg_set_data's contract
+ *  on this group instance, except that no MsgType-grammar check runs (as for every
+ *  entry setter) and a Data field that is the group's delimiter →
+ *  FIXPP_ERR_TYPE_MISMATCH, since its Length would have to come first.
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the entry's
+ *  resolved group or its resolved instance index is out of range.
+ *  Reentrancy: requires-session-lock */
+FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_data(fixpp_entry_t* entry, uint16_t data_tag,
+                                               const uint8_t* bytes, size_t len);
+
+/** Set an INTEGER field on the current entry.
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the entry's
+ *  resolved group instance index is out of range.
+ *  Reentrancy: requires-session-lock */
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_int(fixpp_entry_t* entry, uint16_t tag, int64_t value);
 
 /** Set a DOUBLE field on the current entry. Serialised as locale-independent
  *  fixed-point ASCII (never scientific); FIXPP_ERR_DECIMAL_INVALID for non-finite
- *  or out-of-range values (see fixpp_msg_set_double). Reentrancy: requires-session-lock */
+ *  or out-of-range values (see fixpp_msg_set_double).
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the entry's
+ *  resolved group instance index is out of range.
+ *  Reentrancy: requires-session-lock */
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_double(fixpp_entry_t* entry, uint16_t tag, double value);
 
-/** Set a DECIMAL field on the current entry. Reentrancy: requires-session-lock */
+/** Set a DECIMAL field on the current entry.
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the entry's
+ *  resolved group instance index is out of range.
+ *  Reentrancy: requires-session-lock */
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_set_decimal(fixpp_entry_t* entry, uint16_t tag,
                                                   fixpp_decimal_t value);
 
 /** Begin a NESTED group `group_tag` within `entry` (FR-012). Closed by the same
  *  fixpp_msg_group_end under the LIFO contract. TYPE_MISMATCH if not a group.
+ *  FIXPP_ERR_INVALID_HANDLE, assessed-unreachable defence-in-depth
+ *  ([const §IX.1], not BREAKING — msg-index-bounds.md), if the entry's
+ *  resolved group instance index is out of range.
  *  Reentrancy: requires-session-lock */
 FIXPP_API_EXPORT fixpp_error_t fixpp_entry_group_begin(fixpp_entry_t* entry, uint16_t group_tag,
                                                   fixpp_group_builder_t** builder_out);

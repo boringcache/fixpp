@@ -229,6 +229,19 @@ target_include_directories(capi_message_read_test PRIVATE ${FIXPP_CAPI_FEATURE_B
 add_test(NAME capi_message_read COMMAND capi_message_read_test)
 set_tests_properties(capi_message_read PROPERTIES LABELS "capi;051")
 
+# fixpp#428 / #426 (design .specify/426-428-length-data-pairs.md §5, §6): the C-ABI
+# Length+Data setters and commit-time pair rule, and a two-engine loopback whose
+# EncodedText holds SOH through send, receive and clone.
+add_executable(capi_length_data_test length_data_setters_test.cpp length_data_send_recv_test.cpp)
+target_link_libraries(capi_length_data_test PRIVATE
+  fixpp_capi
+  GTest::gtest
+  GTest::gtest_main
+)
+target_include_directories(capi_length_data_test PRIVATE ${FIXPP_CAPI_FEATURE_B_INCLUDES})
+add_test(NAME capi_length_data COMMAND capi_length_data_test)
+set_tests_properties(capi_length_data PROPERTIES LABELS "capi;426;428;length-data")
+
 # message_read_failloud_test — 073 (L-065-2, #184) T006: nested-read
 # arena-exhaustion fail-loud witness (RED-first against pristine source).
 add_executable(capi_message_read_failloud_test message_read_failloud_test.cpp)
@@ -249,6 +262,9 @@ target_link_libraries(capi_message_write_test PRIVATE
   GTest::gtest_main
 )
 target_include_directories(capi_message_write_test PRIVATE ${FIXPP_CAPI_FEATURE_B_INCLUDES})
+target_compile_definitions(capi_message_write_test PRIVATE
+  "FIXPP_DICT_DATA_DIR=\"${CMAKE_SOURCE_DIR}/dictionaries\""
+)
 add_test(NAME capi_message_write COMMAND capi_message_write_test)
 set_tests_properties(capi_message_write PROPERTIES LABELS "capi;051")
 
@@ -348,76 +364,68 @@ target_compile_definitions(capi_dictionary_load_test PRIVATE
 add_test(NAME capi_dictionary_load COMMAND capi_dictionary_load_test)
 set_tests_properties(capi_dictionary_load PROPERTIES LABELS "capi;052;080")
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/tools/mallocnesia/libmallocnesia.so")
-    add_test(
-        NAME capi_recv_alloc_guard_mallocnesia
-        COMMAND
-            python3 "${CMAKE_SOURCE_DIR}/tools/check_alloc.py"
-            "--binary" "$<TARGET_FILE:capi_recv_alloc_guard_test>"
-    )
-    set_tests_properties(capi_recv_alloc_guard_mallocnesia PROPERTIES
-        LABELS "capi;050;alloc_guard"
-        DEPENDS capi_recv_alloc_guard_test
-    )
+# fixpp#495 D-5 T-20 (`.specify/495-493-486-dict-reify-copy.md` §10): the C loader
+# retains nothing in the host's default resource. Standalone: it installs a
+# process-wide default resource. Its positive control loads through the C++
+# `dict::load_any` with the host resource, hence `fixpp_dictionary`.
+add_executable(capi_dict495_loader_default_resource_test dict495_loader_default_resource_test.cpp)
+target_link_libraries(capi_dict495_loader_default_resource_test PRIVATE
+  fixpp_capi
+  fixpp_dictionary
+  GTest::gtest
+  GTest::gtest_main
+)
+target_compile_definitions(capi_dict495_loader_default_resource_test PRIVATE
+  "FIXPP_DICT_DATA_DIR=\"${CMAKE_SOURCE_DIR}/dictionaries\"")
+add_test(NAME capi_dict495_loader_default_resource
+  COMMAND capi_dict495_loader_default_resource_test)
+set_tests_properties(capi_dict495_loader_default_resource PROPERTIES LABELS "495;capi")
 
-    # SC-003 dual gate — read path: mallocnesia LD_PRELOAD interception for the
-    # inbound get_* accessors. The in-process marker test is in message_read_test.cpp
-    # (ZeroGlobalHeapAllocGuard). A counting-resource alone false-passes
-    # ([[feedback_tracking_pmr_resource_false_pass]]); this entry is the binding gate.
-    add_test(
-        NAME capi_message_read_mallocnesia
-        COMMAND
-            python3 "${CMAKE_SOURCE_DIR}/tools/check_alloc.py"
-            "--binary" "$<TARGET_FILE:capi_message_read_test>"
-    )
-    set_tests_properties(capi_message_read_mallocnesia PROPERTIES
-        LABELS "capi;051;alloc_guard"
-        DEPENDS capi_message_read_test
-    )
+fixpp_add_mallocnesia_test(
+  NAME capi_recv_alloc_guard_mallocnesia
+  TARGET capi_recv_alloc_guard_test
+  LABELS "capi;050;alloc_guard"
+  DEPENDS "capi_recv_alloc_guard")
 
-    # SC-003 dual gate — write path: mallocnesia LD_PRELOAD interception for the
-    # outbound set_*/commit accessors. The in-process marker test is in
-    # message_write_test.cpp (ZeroGlobalHeapSetCommitGuard).
-    add_test(
-        NAME capi_message_write_mallocnesia
-        COMMAND
-            python3 "${CMAKE_SOURCE_DIR}/tools/check_alloc.py"
-            "--binary" "$<TARGET_FILE:capi_message_write_test>"
-    )
-    set_tests_properties(capi_message_write_mallocnesia PROPERTIES
-        LABELS "capi;051;alloc_guard"
-        DEPENDS capi_message_write_test
-    )
+# SC-003 dual gate — read path: mallocnesia LD_PRELOAD interception for the
+# inbound get_* accessors. The in-process marker test is in message_read_test.cpp
+# (ZeroGlobalHeapAllocGuard). A counting-resource alone false-passes
+# ([[feedback_tracking_pmr_resource_false_pass]]); this entry is the binding gate.
+fixpp_add_mallocnesia_test(
+  NAME capi_message_read_mallocnesia
+  TARGET capi_message_read_test
+  LABELS "capi;051;alloc_guard"
+  DEPENDS "capi_message_read")
 
-    # SC-003 dual gate — toApp path: mallocnesia LD_PRELOAD interception for the
-    # on-strand toApp trampoline (CapiApplication::toApp). The in-process marker
-    # test is in toapp_alloc_guard_test.cpp (TrampolineToAppNoGlobalHeapAlloc).
-    # Third zero-heap path per SC-003 / T020 ([[feedback_tracking_pmr_resource_false_pass]]).
-    add_test(
-        NAME capi_toapp_alloc_guard_mallocnesia
-        COMMAND
-            python3 "${CMAKE_SOURCE_DIR}/tools/check_alloc.py"
-            "--binary" "$<TARGET_FILE:capi_toapp_alloc_guard_test>"
-    )
-    set_tests_properties(capi_toapp_alloc_guard_mallocnesia PROPERTIES
-        LABELS "capi;051;alloc_guard"
-        DEPENDS capi_toapp_alloc_guard_test
-    )
+# SC-003 dual gate — write path: mallocnesia LD_PRELOAD interception for the
+# outbound set_*/commit accessors. The in-process marker test is in
+# message_write_test.cpp (ZeroGlobalHeapSetCommitGuard).
+fixpp_add_mallocnesia_test(
+  NAME capi_message_write_mallocnesia
+  TARGET capi_message_write_test
+  LABELS "capi;051;alloc_guard"
+  DEPENDS "capi_message_write")
 
-    # SC-003 dual gate — field iteration: mallocnesia LD_PRELOAD interception for
-    # fixpp_msg_field_count + fixpp_msg_field_at (CA-053 / 052 US3).  These functions
-    # are pure span lookups over the OffsetTable; the in-process alloc_guard_markers
-    # test confirms zero-alloc; mallocnesia is the binding gate
-    # ([[feedback_tracking_pmr_resource_false_pass]]).
-    add_test(NAME capi_message_field_iteration_mallocnesia
-        COMMAND python3 "${CMAKE_SOURCE_DIR}/tools/check_alloc.py"
-                "--binary" "$<TARGET_FILE:capi_message_field_iteration_test>"
-    )
-    set_tests_properties(capi_message_field_iteration_mallocnesia PROPERTIES
-        LABELS "capi;052;alloc_guard"
-        DEPENDS capi_message_field_iteration_test
-    )
-endif()
+# SC-003 dual gate — toApp path: mallocnesia LD_PRELOAD interception for the
+# on-strand toApp trampoline (CapiApplication::toApp). The in-process marker
+# test is in toapp_alloc_guard_test.cpp (TrampolineToAppNoGlobalHeapAlloc).
+# Third zero-heap path per SC-003 / T020 ([[feedback_tracking_pmr_resource_false_pass]]).
+fixpp_add_mallocnesia_test(
+  NAME capi_toapp_alloc_guard_mallocnesia
+  TARGET capi_toapp_alloc_guard_test
+  LABELS "capi;051;alloc_guard"
+  DEPENDS "capi_toapp_alloc_guard")
+
+# SC-003 dual gate — field iteration: mallocnesia LD_PRELOAD interception for
+# fixpp_msg_field_count + fixpp_msg_field_at (CA-053 / 052 US3).  These functions
+# are pure span lookups over the OffsetTable; the in-process alloc_guard_markers
+# test confirms zero-alloc; mallocnesia is the binding gate
+# ([[feedback_tracking_pmr_resource_false_pass]]).
+fixpp_add_mallocnesia_test(
+  NAME capi_message_field_iteration_mallocnesia
+  TARGET capi_message_field_iteration_test
+  LABELS "capi;052;alloc_guard"
+  DEPENDS "capi_message_field_iteration")
 
 # ── 066-dict-backed-inbound-parse T001 — C-ABI engine-loopback scaffold smoke ─
 # Compile/smoke check for capi_dict066_loopback_support.hpp (a real
@@ -523,6 +531,44 @@ target_compile_definitions(capi_dict066_clone_identity_test PRIVATE
 add_test(NAME capi_dict066_clone_identity COMMAND capi_dict066_clone_identity_test)
 set_tests_properties(capi_dict066_clone_identity PROPERTIES
   LABELS "066;us1;capi")
+
+# fixpp#495 T-13, C twin (`.specify/495-493-486-dict-reify-copy.md` §10): two
+# clones from the shipped C-ABI dispatch path share the session's table and
+# outlive the engine. Standalone: a live two-engine loopback.
+add_executable(capi_dict495_clone_shared_table_test dict495_clone_shared_table_test.cpp)
+target_link_libraries(capi_dict495_clone_shared_table_test PRIVATE
+  fixpp_capi
+  GTest::gtest
+  GTest::gtest_main
+)
+target_include_directories(capi_dict495_clone_shared_table_test PRIVATE
+  ${FIXPP_CAPI_FEATURE_B_INCLUDES}
+)
+target_compile_definitions(capi_dict495_clone_shared_table_test PRIVATE
+  "FIXPP_DICT_DATA_DIR=\"${CMAKE_SOURCE_DIR}/dictionaries\""
+)
+add_test(NAME capi_dict495_clone_shared_table COMMAND capi_dict495_clone_shared_table_test)
+set_tests_properties(capi_dict495_clone_shared_table PROPERTIES
+  LABELS "495;capi")
+
+# fixpp#495 T-11 (`.specify/495-493-486-dict-reify-copy.md` §10): a handle and a
+# clone pin the snapshot's table, not the Dictionary or its heap load arena.
+# Standalone: a second thread; run under ASan and TSan.
+add_executable(capi_dict495_pinned_table_lifetime_test dict495_pinned_table_lifetime_test.cpp)
+target_link_libraries(capi_dict495_pinned_table_lifetime_test PRIVATE
+  fixpp_capi
+  GTest::gtest
+  GTest::gtest_main
+)
+target_include_directories(capi_dict495_pinned_table_lifetime_test PRIVATE
+  ${FIXPP_CAPI_FEATURE_B_INCLUDES}
+)
+target_compile_definitions(capi_dict495_pinned_table_lifetime_test PRIVATE
+  "FIXPP_DICT_DATA_DIR=\"${CMAKE_SOURCE_DIR}/dictionaries\""
+)
+add_test(NAME capi_dict495_pinned_table_lifetime COMMAND capi_dict495_pinned_table_lifetime_test)
+set_tests_properties(capi_dict495_pinned_table_lifetime PROPERTIES
+  LABELS "495;capi;tsan")
 
 # gate-b/r1 FQ-1 (PR #181 round 1, Finding 1): OOM hardening witness for
 # MessageView::membership_copy() (now NOT noexcept) — a bad_alloc during the

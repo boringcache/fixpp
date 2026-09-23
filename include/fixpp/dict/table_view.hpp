@@ -22,7 +22,21 @@
 // STORAGE (E-2, data-model.md):
 // Owns its tables using std::vector / std::unordered_map. Constructed ONCE at
 // session/validator setup time by `Dictionary::as_table_view()` ([const §XV.1]
-// — config-time, not per-message). Immutable after construction.
+// — config-time, not per-message). Its POPULATION SURFACE is sealed as of
+// fixpp#456 (`.specify/456-table-view-seal.md`): `table_view`'s sixteen
+// population members are `private`; its only `friend` is
+// `table_view_builder`, which holds its own `table_view` by value and yields
+// it from `build() &&`; both `operator=` overloads are `= delete`.
+// ⚠️ This does not make the object unwritable. The `std::uint16_t` elements
+// behind `required_fields`, `group_member_tags` and `group_required_members`
+// are allocated by the member vectors and are not `const` objects, so
+// `const_cast` on a span's pointer and a write through it is defined
+// behaviour — on a `const` view as much as a non-`const` one. A non-`const`
+// view can additionally be moved from, and an `optional<table_view>`
+// re-seated with `emplace` substitutes a different object at the same
+// address
+// (`B-456-2`); declaring the view `const` closes those two and not the
+// first.
 //
 // INCLUDE-GRAPH CONSTRAINT ([const §XV.9]):
 // This header is included (transitively) by `validator.hpp`, which lands on
@@ -39,14 +53,17 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <fixpp/dict/field_type.hpp>  // field_type (7-value enum)
+#include <fixpp/core/length_data_pairs.hpp>  // is_standard_pair_tag (the standard pairs)
+#include <fixpp/dict/field_type.hpp>         // field_type (7-value enum)
 #include <functional>
 #include <optional>  // group_first_field_exact (fixpp#215 item 2) — header-only, alloc-free
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace fixpp::dict {
@@ -271,10 +288,12 @@ private:
 // `wire::dictionary_driven_validator`. Owns its backing storage; spans
 // returned by the methods remain valid for the lifetime of this object.
 //
-// Copyable AND movable — see the copy/move block below, which defaults all four.
-// (This line read "move-only … copying is intentionally deleted" until fixpp#215;
-// that was contradicted by the very next declarations and had been false since the
-// copy ctor was defaulted. Copies are load-bearing, not incidental:
+// Copy- AND move-CONSTRUCTIBLE, and neither copy- nor move-ASSIGNABLE — see the
+// copy/move block below. (This line read "move-only … copying is intentionally
+// deleted" until fixpp#215; that was contradicted by the very next declarations
+// and had been false since the copy ctor was defaulted. Then it read "Copyable
+// AND movable … defaults all four", which fixpp#456 falsified by deleting both
+// assignment operators. Copies are load-bearing, not incidental:
 // `wire::dictionary_driven_validator` holds its `table_view` BY VALUE — a frozen
 // design point, "SC-007: no virtual edge" — so every validating session
 // copy-constructs one.)
@@ -283,14 +302,32 @@ public:
     table_view() = default;
     ~table_view() = default;
 
-    // Copy and move — both allowed. Copies duplicate the owned tables (used
-    // when a single table_view configuration seeds multiple validator instances,
-    // and by the mock-compatibility static_assert in validator_domain_test.cpp).
-    // Move is noexcept; copy may throw on allocation failure.
+    // Copy and move CONSTRUCTION — both allowed. Copies duplicate the owned tables
+    // (used when a single table_view configuration seeds multiple validator
+    // instances, and by the mock-compatibility static_assert in
+    // validator_domain_test.cpp). Copy may throw on allocation failure.
+    //
+    // The move CONSTRUCTOR is deliberately NOT spelled `noexcept` (Gate B r7 N-2,
+    // carried across from the move-assignment fixpp#456 deleted): declaring it would
+    // make the assertion below the class observe that promise instead of proving it
+    // — since P1286R2 an explicit exception specification on a defaulted special
+    // member simply wins over the implicit one — and a member that later moved
+    // throwingly would keep the assertion green while silently making every
+    // `build()`, every `optional::emplace` and every by-value validator seat a
+    // throwing move. Left to be inferred, the assertion is a proof.
     table_view(table_view const&) = default;
-    table_view& operator=(table_view const&) = default;
-    table_view(table_view&&) noexcept = default;
-    table_view& operator=(table_view&&) noexcept = default;
+    table_view(table_view&&) = default;
+
+    // fixpp#456: assignment is DELETED, in both forms. A caller who can write
+    // `published = other;` has not been sealed — copy-assignment moves the exact
+    // `has_nonstandard_pair_` bit the seal exists to freeze (the deleted
+    // `DictHooksCustomPair.CopyAssignmentCarriesTheFlagWithThePairs` proved it).
+    // The hand-written strong-guarantee copy-assignment that stood here existed
+    // ONLY to commit through the nothrow move-assignment; both go together.
+    // Re-populate through `table_view_builder` instead; seat an optional with
+    // `emplace`, not with assignment.
+    table_view& operator=(table_view const&) = delete;
+    table_view& operator=(table_view&&) = delete;
 
     // ── 6-method validator surface (C-1) ────────────────────────────────────
 
@@ -510,6 +547,35 @@ public:
         return group_required_members(no_tag);  // legacy bare fallback
     }
 
+    // fixpp#426 (design §3): the Data tag this dictionary pairs with
+    // `length_tag`, or 0 when `length_tag` has no dictionary-declared pair.
+    // Dictionary-wide (a tag's Length+Data pairing is a per-tag property, not
+    // a per-msg_type one — mirrors `Dictionary::length_pair_data_tag`, the
+    // fixpp#427 runtime-handle accessor this table copies from at
+    // `Dictionary::as_table_view()`). Read by `wire::dict_hooks::
+    // data_tag_for_length`, which applies the standard table first and this
+    // one only for a tag neither side of the standard table names.
+    [[nodiscard]] std::uint16_t length_pair_data_tag(std::uint16_t length_tag) const noexcept {
+        auto const it = length_pair_data_tag_.find(length_tag);
+        return it == length_pair_data_tag_.end() ? std::uint16_t{0} : it->second;
+    }
+
+    // fixpp#428 (design §3): the inverse — the Length tag this dictionary pairs
+    // with `data_tag`, or 0. Read by `wire::dict_hooks::length_tag_for_data`.
+    [[nodiscard]] std::uint16_t data_pair_length_tag(std::uint16_t data_tag) const noexcept {
+        auto const it = data_pair_length_tag_.find(data_tag);
+        return it == data_pair_length_tag_.end() ? std::uint16_t{0} : it->second;
+    }
+
+    // True once some registered pair has BOTH tags outside the standard table — the
+    // only pairs `wire::dict_hooks` can honour (design §3: the standard table governs
+    // any tag it names). It only ever goes true, so a re-pair that drops the last such
+    // pair leaves a lookup that answers 0 rather than a wrong answer.
+    // `wire::dict_hooks::for_table_view` reads it to decide whether to install the pair
+    // callback at all: every shipped dictionary declares standard pairs only, and then
+    // no scanner pays a lookup per field.
+    [[nodiscard]] bool has_nonstandard_pair() const noexcept { return has_nonstandard_pair_; }
+
     // ── 081 Concern A: validator-private FIXT.1.1 framing surface ──────────
     // (research.md D-1/D-2, data-model.md E-2). Populated by
     // Dictionary::as_table_view() ONLY for v50/v50sp1/v50sp2 (empty
@@ -622,13 +688,26 @@ public:
         return true;
     }
 
+private:
+    friend class table_view_builder;
+
     // ── Build-time population surface ────────────────────────────────────────
-    // Used by Dictionary::as_table_view() (non-chain void) and by test code
-    // via the chain-style API below. Not part of the validator-facing contract.
+    // PRIVATE since fixpp#456: every caller reaches these through
+    // `table_view_builder` (below), which is the type's only friend that points
+    // inward. `Dictionary::as_table_view()` is deliberately NOT a friend — it
+    // populates a builder like every other caller. Not part of the
+    // validator-facing contract.
     //
-    // The chain-style methods mirror the test mock's builder surface so that
-    // existing tests/wire/validator_*_test.cpp TUs can drop the mock include
-    // and use this production type directly (RC-A closure, T009).
+    // Seam 2's friendship census is a DECLARATION count, and the pattern that
+    // implements it is anchored at `^[[:space:]]*friend[[:space:]]+class` (the
+    // recipe lives in the seal witness's header comment). That anchor cannot
+    // match a `//`-prefixed line, so prose here — including this sentence — is
+    // outside it by construction. Nothing needs to avoid the word.
+    //
+    // These methods mirror the test mock's builder surface; the builder's
+    // forwarders preserve that spelling, so a migrated call site differs only in
+    // the receiver's name. Chaining lives on `table_view_builder`, whose
+    // forwarders return `table_view_builder&`; nothing chains on this band.
 
     void add_valid_tag(std::string_view msg_type, std::uint16_t tag) {
         valid_[std::string{msg_type}].insert(tag);
@@ -641,60 +720,47 @@ public:
 
     void set_field_type(std::uint16_t tag, field_type ft) { types_[tag] = ft; }
 
-    // add_group_member returns *this for chaining (mirrors mock surface).
-    table_view& add_group_member(std::uint16_t no_tag, std::uint16_t member_tag) {
+    void add_group_member(std::uint16_t no_tag, std::uint16_t member_tag) {
         set_group_bit(no_tag);
         auto& members = group_members_[no_tag];
         for (auto const t : members) {
-            if (t == member_tag) return *this;  // dedup
+            if (t == member_tag) return;  // dedup
         }
         members.push_back(member_tag);
-        return *this;
     }
 
     // fixpp#201: register `member_tag` as a DIRECT required member of group
     // `no_tag` (bare store). Does NOT add it to the member set — callers pair
     // this with add_group_member/set_group_first as needed.
-    table_view& add_group_required_member(std::uint16_t no_tag, std::uint16_t member_tag) {
+    void add_group_required_member(std::uint16_t no_tag, std::uint16_t member_tag) {
         set_group_bit(no_tag);
         auto& req = group_required_members_[no_tag];
         for (auto const t : req) {
-            if (t == member_tag) return *this;  // dedup
+            if (t == member_tag) return;  // dedup
         }
         req.push_back(member_tag);
-        return *this;
     }
 
-    // Chain-style helpers — all return *this for fluent use.
+    void add_valid(std::string_view msg_type, std::uint16_t tag) { add_valid_tag(msg_type, tag); }
 
-    table_view& add_valid(std::string_view msg_type, std::uint16_t tag) {
-        add_valid_tag(msg_type, tag);
-        return *this;
-    }
-
-    table_view& add_required(std::string_view msg_type, std::uint16_t tag) {
+    void add_required(std::string_view msg_type, std::uint16_t tag) {
         add_required_tag(msg_type, tag);
-        return *this;
     }
 
-    table_view& set_type(std::uint16_t tag, field_type ft) {
-        set_field_type(tag, ft);
-        return *this;
-    }
+    void set_type(std::uint16_t tag, field_type ft) { set_field_type(tag, ft); }
 
     // set_group_first: sets the first-delimiter tag AND adds it as a member
     // (mirrors the mock's set_group_first behaviour exactly).
-    table_view& set_group_first(std::uint16_t no_tag, std::uint16_t first) {
+    void set_group_first(std::uint16_t no_tag, std::uint16_t first) {
         set_group_bit(no_tag);
         group_first_[no_tag] = first;
         add_group_member(no_tag, first);
-        return *this;
     }
 
     // Inserts an OWNED COPY of `value`'s bytes into `tag`'s code list (see
     // `enum_domain` above for why the table owns them). Sorted-on-insert and
     // deduped, so enum_valid's binary search is valid regardless of call order.
-    table_view& add_enum(std::uint16_t tag, std::string_view value) {
+    void add_enum(std::uint16_t tag, std::string_view value) {
         set_enum_bit(tag);
         auto& domain = enums_[tag];
         auto& codes = domain.codes;
@@ -715,16 +781,14 @@ public:
         } else {
             domain.all_single_char = false;
         }
-        return *this;
     }
 
     // T019 companion [FR-005]: the multi-value bit `add_enum` cannot itself
     // carry — without this, FR-004's tokenizer (T018) has no unit-level
     // witness that does not require a full XML load.
-    table_view& set_multi_value(std::uint16_t tag, bool multi = true) {
+    void set_multi_value(std::uint16_t tag, bool multi = true) {
         set_enum_bit(tag);
         enums_[tag].multi_value = multi;
-        return *this;
     }
 
     // ── 063 Defect-A: context-scoped population surface ───────────────────
@@ -770,6 +834,61 @@ public:
     void add_fixt_framing_tag(std::uint16_t tag, field_type ft) {
         fixt_framing_tags_.insert(tag);
         fixt_framing_types_[tag] = ft;
+    }
+
+    // fixpp#426: registers `length_tag`'s dictionary-declared Data partner.
+    // Used EXCLUSIVELY by Dictionary::as_table_view(). A zero `data_tag` is a
+    // no-op (`length_pair_data_tag` already answers 0 for an unregistered
+    // key), so callers need not pre-filter FieldRef::length_pair_data_tag==0.
+    void set_length_pair_data_tag(std::uint16_t length_tag, std::uint16_t data_tag) {
+        // Zero is the "no pair" answer of BOTH accessors, so it cannot be half of one:
+        // storing 0 -> data would read back as a forward pair whose inverse says absent,
+        // and the two directions could never agree again (Gate B r8 P-2). A zero
+        // data_tag stays a silent no-op, which is what Dictionary::as_table_view()
+        // relies on for every field with no declared partner.
+        if (length_tag == 0 || data_tag == 0) {
+            return;
+        }
+        // Strong guarantee (Gate B r6 M-2) at O(1) (Gate B r7 N-1): capture what this
+        // call would overwrite, insert forward, and insert inverse under a rollback.
+        // Only the two insertions can throw, and only when they need a NEW node; the
+        // rollback is an erase (noexcept) or an assignment to a key that already
+        // exists, whose mapped type is a std::uint16_t — no allocation either way. So
+        // a failed allocation leaves both maps exactly as they were, and the "two
+        // directions never disagree" invariant (Gate B r1 G-4) holds through it.
+        //
+        // ⚠️ An earlier revision took the obvious route — copy both maps, mutate the
+        // copies, commit with nothrow moves. It is correct and it made
+        // `Dictionary::as_table_view()` quadratic in the pair count: measured +26.3 %
+        // on FIX42 and +10.4 % on FIX44 against the merge-base. Do not reintroduce it.
+        std::uint16_t const displaced_data = length_pair_data_tag(length_tag);
+        std::uint16_t const displaced_length = data_pair_length_tag(data_tag);
+
+        length_pair_data_tag_[length_tag] = data_tag;
+        try {
+            data_pair_length_tag_[data_tag] = length_tag;
+        } catch (...) {
+            if (displaced_data == 0) {
+                length_pair_data_tag_.erase(length_tag);
+            } else {
+                length_pair_data_tag_[length_tag] = displaced_data;
+            }
+            throw;
+        }
+
+        // Re-pairing either tag drops its old partner, so the two stay inverse. Both
+        // erases are noexcept, and they run only once the pair itself has landed.
+        if (displaced_data != 0 && displaced_data != data_tag) {
+            data_pair_length_tag_.erase(displaced_data);
+        }
+        if (displaced_length != 0 && displaced_length != length_tag) {
+            length_pair_data_tag_.erase(displaced_length);
+        }
+        // Last, so the flag never describes a pair that did not land.
+        if (!fixpp::core::detail::is_standard_pair_tag(length_tag) &&
+            !fixpp::core::detail::is_standard_pair_tag(data_tag)) {
+            has_nonstandard_pair_ = true;
+        }
     }
 
 private:
@@ -916,6 +1035,180 @@ private:
     // (field_type_of_with_framing).
     std::unordered_set<std::uint16_t> fixt_framing_tags_;
     std::unordered_map<std::uint16_t, field_type> fixt_framing_types_;
+
+    // fixpp#426 (design §3): Length tag -> its dictionary-declared Data
+    // partner. Populated ONLY by Dictionary::as_table_view() from
+    // FieldRef::length_pair_data_tag (see set_length_pair_data_tag above).
+    std::unordered_map<std::uint16_t, std::uint16_t> length_pair_data_tag_;
+    // fixpp#428: Data tag -> its Length partner; filled beside the map above.
+    std::unordered_map<std::uint16_t, std::uint16_t> data_pair_length_tag_;
+    // See has_nonstandard_pair(): set by set_length_pair_data_tag, never cleared.
+    bool has_nonstandard_pair_ = false;
+};
+
+// Move CONSTRUCTION is the property that became load-bearing when fixpp#456 deleted
+// assignment: it is how `table_view_builder::build() &&` returns, how
+// `std::optional<table_view>::emplace` seats a view, and how the by-value validator
+// copy is moved into place. The move constructor's exception specification is
+// INFERRED from the members (see its declaration), so whether those paths move
+// nothrow is a property of every member rather than a promise this class made about
+// itself — which is the whole reason the specification is left inferred.
+//
+// MEASURED on MSVC, and it decided FALSE — so the assertion that stood here is
+// REMOVED, per the disposition `.specify/456-table-view-seal.md` §3.2/§7 wrote in
+// advance for exactly this outcome. `L-456-2` records what it costs and names the
+// members. The Microsoft STL does not declare its `unordered_map`/`unordered_set`
+// move constructors `noexcept`, and this class holds ten of them; `std::vector`,
+// `std::string`, the hash/equal functors and the allocator are all fine, so it is
+// the hash containers themselves, not anything this class does to them.
+//
+// ⛔ Do NOT restore an explicit `noexcept` on the move constructor to make this
+// compile again. Since P1286R2 the explicit specification simply WINS over the
+// inferred one, so it would not make the move any safer — it would only re-hide
+// the fact on every lane. That mask is what `main` shipped, and removing it is how
+// this was found.
+//
+// Re-derive per toolchain — the answer is a property of the STL, not of this file:
+//   static_assert(std::is_nothrow_move_constructible_v<
+//       std::unordered_map<std::uint16_t, std::uint16_t>>);
+
+// ── fixpp#456: the mutation surface, as a distinct owning type ───────────────
+// `table_view`'s sixteen mutators are private; this is the only way to reach them.
+// It holds a `table_view` BY VALUE — a stack-local scaffold with no reference to
+// anything — and `build() &&` moves that view out. No back-pointer, no lifetime
+// edge, nothing to dangle.
+//
+// Shape (design §3.1 S1, §3.3):
+//   table_view_builder b;
+//   b.add_valid("D", 11);
+//   b.set_field_type(11, field_type::String);
+//   table_view const tv = std::move(b).build();
+//
+// ⚠️ `build()` is `&&`-qualified, so a NAMED builder must be spelled
+// `std::move(b).build()` and the consumption is visible at the call site. The
+// forwarders return `table_view_builder&` — an LVALUE — so a chained prvalue
+// (`table_view_builder{}.add_valid(…).build()`) does NOT compile. That friction is
+// deliberate; write two statements.
+//
+// ⚠️ There is deliberately no `table_view const& peek()` (design §5d item 4): the
+// reference it returned would point into storage `build() &&` subsequently moves
+// from. The three `const` readbacks below are SCALARS — nothing to escape — and
+// exist for the witnesses that must assert state mid-build.
+//
+// `build()` performs NO consistency validation (L-456-1): a builder can still
+// produce an internally inconsistent table (a group with members and no first
+// field — B-384-2). The seal governs reachability, not consistency: `build()`
+// is `return std::move(tv_);` and checks nothing.
+class table_view_builder {
+public:
+    // ── the sixteen forwarders, each returning *this for chaining ───────────
+    table_view_builder& add_valid_tag(std::string_view msg_type, std::uint16_t tag) {
+        tv_.add_valid_tag(msg_type, tag);
+        return *this;
+    }
+
+    table_view_builder& add_required_tag(std::string_view msg_type, std::uint16_t tag) {
+        tv_.add_required_tag(msg_type, tag);
+        return *this;
+    }
+
+    table_view_builder& set_field_type(std::uint16_t tag, field_type ft) {
+        tv_.set_field_type(tag, ft);
+        return *this;
+    }
+
+    table_view_builder& add_group_member(std::uint16_t no_tag, std::uint16_t member_tag) {
+        tv_.add_group_member(no_tag, member_tag);
+        return *this;
+    }
+
+    table_view_builder& add_group_required_member(std::uint16_t no_tag, std::uint16_t member_tag) {
+        tv_.add_group_required_member(no_tag, member_tag);
+        return *this;
+    }
+
+    table_view_builder& add_valid(std::string_view msg_type, std::uint16_t tag) {
+        tv_.add_valid(msg_type, tag);
+        return *this;
+    }
+
+    table_view_builder& add_required(std::string_view msg_type, std::uint16_t tag) {
+        tv_.add_required(msg_type, tag);
+        return *this;
+    }
+
+    table_view_builder& set_type(std::uint16_t tag, field_type ft) {
+        tv_.set_type(tag, ft);
+        return *this;
+    }
+
+    table_view_builder& set_group_first(std::uint16_t no_tag, std::uint16_t first) {
+        tv_.set_group_first(no_tag, first);
+        return *this;
+    }
+
+    table_view_builder& add_enum(std::uint16_t tag, std::string_view value) {
+        tv_.add_enum(tag, value);
+        return *this;
+    }
+
+    table_view_builder& set_multi_value(std::uint16_t tag, bool multi = true) {
+        tv_.set_multi_value(tag, multi);
+        return *this;
+    }
+
+    table_view_builder& add_group_member_ctx(std::string_view msg_type,
+                                             std::span<std::uint16_t const> parent_path,
+                                             std::uint16_t no_tag, std::uint16_t member_tag) {
+        tv_.add_group_member_ctx(msg_type, parent_path, no_tag, member_tag);
+        return *this;
+    }
+
+    table_view_builder& add_group_required_member_ctx(std::string_view msg_type,
+                                                      std::span<std::uint16_t const> parent_path,
+                                                      std::uint16_t no_tag,
+                                                      std::uint16_t member_tag) {
+        tv_.add_group_required_member_ctx(msg_type, parent_path, no_tag, member_tag);
+        return *this;
+    }
+
+    table_view_builder& set_group_first_ctx(std::string_view msg_type,
+                                            std::span<std::uint16_t const> parent_path,
+                                            std::uint16_t no_tag, std::uint16_t first) {
+        tv_.set_group_first_ctx(msg_type, parent_path, no_tag, first);
+        return *this;
+    }
+
+    table_view_builder& add_fixt_framing_tag(std::uint16_t tag, field_type ft) {
+        tv_.add_fixt_framing_tag(tag, ft);
+        return *this;
+    }
+
+    table_view_builder& set_length_pair_data_tag(std::uint16_t length_tag,
+                                                 std::uint16_t data_tag) {
+        tv_.set_length_pair_data_tag(length_tag, data_tag);
+        return *this;
+    }
+
+    // ── scalar readbacks, for the witnesses that assert BETWEEN mutations ─────
+    // Scalars by design: a reference-returning accessor would alias storage that
+    // `build() &&` moves from. See the `peek()` refusal above.
+    [[nodiscard]] std::uint16_t length_pair_data_tag(std::uint16_t length_tag) const noexcept {
+        return tv_.length_pair_data_tag(length_tag);
+    }
+
+    [[nodiscard]] std::uint16_t data_pair_length_tag(std::uint16_t data_tag) const noexcept {
+        return tv_.data_pair_length_tag(data_tag);
+    }
+
+    [[nodiscard]] bool has_nonstandard_pair() const noexcept { return tv_.has_nonstandard_pair(); }
+
+    // Consumes the builder. The move is a member-to-return move, so NRVO cannot
+    // apply; C++17 guaranteed elision then makes the caller's own return free.
+    [[nodiscard]] table_view build() && { return std::move(tv_); }
+
+private:
+    table_view tv_;
 };
 
 }  // namespace fixpp::dict

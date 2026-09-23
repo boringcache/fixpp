@@ -10,17 +10,13 @@
 find_package(GTest CONFIG REQUIRED)
 find_package(pugixml CONFIG REQUIRED)
 
-# WORKING_DIRECTORY is load-bearing, not decoration. The gate this drives does
-# `cd "$(git rev-parse --show-toplevel)"` and then greps RELATIVE paths
-# (src/ include/ bindings/ tools/ tests/). ctest runs a test from the BUILD dir
-# by default, so with an out-of-tree build directory — a symlinked or relocated
-# `build/<preset>`, which the repo's own presets make easy — `git rev-parse`
-# fails, every grep resolves nothing, and the run is scored against an empty
-# corpus. The gate itself catches that (its G1 liveness check reports
-# "scanner broken" and exits 1), but the harness's three RED arms expect exit 1
-# and so pass VACUOUSLY in that state: they see the scanner's failure, not the
-# removed static_asserts they exist to detect. Only the positive arm fails.
-# Pinning cwd to the source tree is what keeps those three arms meaningful.
+# The self-test copies the directories the gate scans into a temp dir, seeds
+# only that copy, and runs the gate on it with `--root`; it never edits the
+# source tree, so it needs no RUN_SERIAL and no lock shared with the git-clean
+# `fixpp::dict::codegen-build-graph-check`. A copy the gate cannot read makes
+# the RED arms pass VACUOUSLY (they expect exit 1, which the G1 liveness
+# "scanner broken" failure also gives); the clean arm, run on the same copy,
+# is the one that fails in that state.
 add_test(NAME dictionary_snapshot_exclusivity_gate
   COMMAND bash "${CMAKE_SOURCE_DIR}/tools/test_dictionary_snapshot_exclusivity_gate.sh"
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -131,6 +127,57 @@ target_link_libraries(dictionary_table_view_enum_domain_test PRIVATE
 )
 add_test(NAME dictionary_table_view_enum_domain_test COMMAND dictionary_table_view_enum_domain_test)
 set_tests_properties(dictionary_table_view_enum_domain_test PROPERTIES LABELS "075;dictionary")
+
+# ── fixpp#456 seam 1: the compile-time seal witness ─────────────────────────
+# An ORDINARY TU, deliberately NOT a WILL_FAIL negative-compile target: such a
+# target passes for any compile error at all (design §6 seam 1 gives the reasons,
+# and tests/consumer/CMakeLists.txt rule 2 already wrote the argument down). Its
+# own "456" label selects it without widening the dictionary-only bucket.
+add_executable(dictionary_table_view_seal_compile_test table_view_seal_compile_test.cpp)
+target_link_libraries(dictionary_table_view_seal_compile_test PRIVATE
+  fixpp_dictionary
+  GTest::gtest
+  GTest::gtest_main
+)
+add_test(NAME dictionary_table_view_seal_compile_test
+  COMMAND dictionary_table_view_seal_compile_test)
+set_tests_properties(dictionary_table_view_seal_compile_test PROPERTIES LABELS "456;dictionary")
+
+# ── fixpp#456 seam 4: builder/as_table_view() differential ───────────────────
+# Standalone rather than folded into the pure bucket's table_view_test.cpp: it needs
+# its own "456" label — same reason dictionary_table_view_enum_domain_test above is
+# standalone for "075" — and it must stay buildable independently of the rest of the
+# dictionary test tree.
+add_executable(dictionary_table_view_builder_differential_test
+  table_view_builder_differential_test.cpp)
+target_link_libraries(dictionary_table_view_builder_differential_test PRIVATE
+  fixpp_dictionary
+  GTest::gtest
+  GTest::gtest_main
+)
+# tests/support/fix44_dictionary.hpp — same pattern as the reify_* bucket below.
+target_include_directories(dictionary_table_view_builder_differential_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/tests")
+target_compile_definitions(dictionary_table_view_builder_differential_test PRIVATE
+  "FIXPP_DICT_DATA_DIR=\"${FIXPP_DICT_DATA_DIR}\"")
+add_test(NAME dictionary_table_view_builder_differential_test
+  COMMAND dictionary_table_view_builder_differential_test)
+set_tests_properties(dictionary_table_view_builder_differential_test PROPERTIES
+  LABELS "456;dictionary")
+
+# ── fixpp#426 Gate B r7 N-3: Length+Data pair state under allocation failure ──
+# Standalone, not in the pure bucket: it replaces global operator new to fail one
+# allocation at a time ([const §VII.8]'s isolation-sensitive carve-out, the same
+# seam as reify_membership_copy_oom_test). Its own "426" label selects it without
+# widening the dictionary-only bucket.
+add_executable(dictionary_table_view_pair_oom_test table_view_pair_oom_test.cpp)
+target_link_libraries(dictionary_table_view_pair_oom_test PRIVATE
+  fixpp_dictionary
+  GTest::gtest
+  GTest::gtest_main
+)
+add_test(NAME dictionary_table_view_pair_oom_test COMMAND dictionary_table_view_pair_oom_test)
+set_tests_properties(dictionary_table_view_pair_oom_test PROPERTIES LABELS "426;dictionary")
 
 # ── 074-orchestra-native-reader: native Orchestra reader test bucket ─────────
 # Grouped whole-binary executable (const §VII.8), LABELS "dictionary;orchestra";
@@ -306,16 +353,14 @@ set_tests_properties(delimiter_census PROPERTIES LABELS "dictionary;083;census" 
 
 # mallocnesia gate for the group-context lookup no-alloc test — re-runs the
 # standalone binary under LD_PRELOAD so global malloc/calloc/realloc is
-# intercepted (dual gate alongside the in-TU global operator-new counter; absent
-# libmallocnesia.so → skipped, per feedback_tracking_pmr_resource_false_pass).
-if(EXISTS "${CMAKE_SOURCE_DIR}/tools/mallocnesia/libmallocnesia.so")
-  add_test(
-    NAME dictionary_group_context_lookup_alloc_gate_test_mallocnesia
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/tools/check_alloc.py"
-            "--binary" "$<TARGET_FILE:dictionary_group_context_lookup_alloc_gate_test>")
-  set_tests_properties(dictionary_group_context_lookup_alloc_gate_test_mallocnesia PROPERTIES
-    LABELS "dictionary;alloc_guard;mallocnesia;063")
-endif()
+# intercepted (dual gate alongside the in-TU global operator-new counter;
+# the interceptor is a build target, so this is registered on every FIXPP_MALLOCNESIA_SUPPORTED configuration — fixpp#448;
+# rationale for the gate itself: feedback_tracking_pmr_resource_false_pass).
+
+fixpp_add_mallocnesia_test(
+  NAME dictionary_group_context_lookup_alloc_gate_test_mallocnesia
+  TARGET dictionary_group_context_lookup_alloc_gate_test
+  LABELS "dictionary;alloc_guard;063")
 
 # ── US2 Reify tests ─────────────────────────────────────────────────────────
 # These tests include generated <vXX>/Reify.hpp (build-tree only, AC-C4).
@@ -354,6 +399,7 @@ if(TARGET fixpp_codegen_generate)
     reify_cross_strand_test           # TSan target (LABELS dictionary;tsan) + threads
     reify_membership_identity_test    # label-heterogeneous 066;dictionary;us1
     reify_membership_copy_oom_test    # global-new alloc counting + 066;dictionary;us1
+    reify_shared_table_concurrency_test  # fixpp#495 T-17: threads, TSan target (495;dictionary;tsan)
   )
   foreach(target IN LISTS FIXPP_REIFY_STANDALONE)
     add_executable(dictionary_${target} "${target}.cpp")
@@ -375,6 +421,10 @@ if(TARGET fixpp_codegen_generate)
   # reify_cross_strand_test is a TSan target per [const §IX.2] / AC-R5/AC-T3.
   set_tests_properties(dictionary_reify_cross_strand_test PROPERTIES
     LABELS "dictionary;tsan")
+
+  # fixpp#495 T-17 (`.specify/495-493-486-dict-reify-copy.md` §10): a TSan target.
+  set_tests_properties(dictionary_reify_shared_table_concurrency_test PROPERTIES
+    LABELS "495;dictionary;tsan")
 
   # 066-dict-backed-inbound-parse T008: label override so `ctest -L 066`
   # (and the T021/T022 coverage-index / completeness audit) picks these up.

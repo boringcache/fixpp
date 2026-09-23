@@ -135,7 +135,7 @@ SCAN_DIRS = [
 #
 #   .xml   435   `dictionaries/FIX44.xml:2805-2824` -- and the dictionaries DO
 #                move; feature 082 changed group registration across all of them
-#   .yml    62   `tier1.yml:392`, `cache-cleanup.yml:207`
+#   .yml    62   `tier1.yml:392`, `cache-cleanup.yml:207`  (citation-ok: example spellings, not citations)
 #   .txt    45   `CMakeLists.txt:401`, `ci/expected-eligible-tests.txt:13-19`
 #   .cmake  20 · .sh 19 · .py 16 · .json 7 · .toml 3
 #
@@ -1245,14 +1245,14 @@ FORM_CASES = [
     # a source one; the addition gate reads ADDED LINES ONLY, so the size of the
     # pre-existing population was never a reason to permit new members of it.
     ("// contract: constitution.md:456 governs this",                ["A"]),
-    ("// see .specify/2d-threading.md:448 for the block",            ["A"]),
+    ("// see .specify/2d-threading.md:448 for the block",            ["A"]),  # citation-ok: self-test fixture, not a real citation
     # Leading dot AND the parent-repo spelling of this submodule.
-    ("(`.specify/constitution.md:335`) is normative",                ["A"]),
+    ("(`.specify/constitution.md:335`) is normative",                ["A"]),  # citation-ok: self-test fixture, not a real citation
     # Non-C++ targets rot exactly like C++ ones. `.xml` alone is 435 hits, and
     # the dictionaries it names are edited by dictionary features.
     ("// (dictionaries/FIX44.xml:3153-3159, PosUndInstrmtGrp)",      ["A"]),
     ("# gate on `add_subdirectory(bench)` (CMakeLists.txt:339)",     ["A"]),
-    ("# see tier1.yml:392 for the cache key",                        ["A"]),
+    ("# see tier1.yml:392 for the cache key",                        ["A"]),  # citation-ok: self-test fixture, not a real citation
     # The approximation mark does not make it less of a line number.
     ("//   Mutation: drop the kind check in session.cpp:~555",       ["A"]),
     # Same claim, two more punctuations. 18 + 22 in the tree, several in
@@ -1355,8 +1355,8 @@ HUNK_CASES = [
 # a `library/` prefix are REGRESSION pins: each was silently invisible, and each
 # hid a `.specify/` design doc -- the exact surface --shift-audit protects.
 TARGET_CASES = [
-    ("(`.specify/2j-controlplane.md:902`)", [(".specify/2j-controlplane.md", 902)]),
-    ("per `library/.specify/2j-controlplane.md:22` the lint extends",
+    ("(`.specify/2j-controlplane.md:902`)", [(".specify/2j-controlplane.md", 902)]),  # citation-ok: self-test fixture, not a real citation
+    ("per `library/.specify/2j-controlplane.md:22` the lint extends",  # citation-ok: self-test fixture, not a real citation
      [("library/.specify/2j-controlplane.md", 22)]),
     ("cites 2d-threading.md:448 for the block", [("2d-threading.md", 448)]),
     ("// see session.cpp:1258 for the thunk", [("session.cpp", 1258)]),

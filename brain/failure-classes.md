@@ -37,6 +37,63 @@ prints `0` for a whole syntax.
   no match. Assert how many files the sweep actually examined, and check whether any root is a link.
 - ⚠️ **A self-test written from the implementation certifies the implementation**, bug included. Build
   fixtures from the real artefact, verbatim.
+- ⚠️ **A CHECK THAT READS ITS EXPECTATION FROM THE THING IT CHECKS CANNOT FAIL.** The runtime form
+  of the entry above, and it survives review because it looks like good hygiene — no duplication, one
+  source of truth. If the expected value is built from the producer's own constant, a mutation moves
+  **both sides together** and the comparison is inert. It recurs at successively wider scope on the
+  same assertion: first the identifier, then the per-site clause, then the shared prefix constant —
+  each fix removing one import and leaving the next.
+  - **Trigger:** you are writing an expectation, and reaching for a symbol the subject also uses.
+  - **Procedure:** spell the expectation out independently and accept the duplication — it *is* the
+    mechanism. Then prove it: mutate the shared constant and require RED. A pin that imports
+    anything from its subject must be assumed inert until a mutant says otherwise.
+- ⚠️ **A POSITIVE CONTROL PROVES THE COMMAND RAN; IT DOES NOT PROVE THE CORPUS HOLDS THE ANSWER.**
+  A zero can be done correctly: a different pattern, positive on the same corpus. It can still be
+  wrong if the property is not decided in that corpus. 090's design note concluded "libstdc++
+  hardening is off everywhere" from a grep of `cmake/`, `CMakeLists.txt` and `CMakePresets.json`,
+  with `FIXPP_WERROR` as its control. But `_GLIBCXX_ASSERTIONS` is a **library default**, on when
+  not optimising. No pattern over the project's build files could ever have reported it. A hard
+  out-of-range subscript aborted in the debug preset, which was the first sign.
+  - **Trigger:** you are concluding that a toolchain or library property is off because no project
+    flag sets it.
+  - **Procedure:** ask the compiler, not the build files. Preprocess with the real toolchain and
+    flags, test the macro, and do it once per optimisation level the presets use.
+  - ⭐ **Check what survives before rewriting the conclusion.** In 090 the premise was wrong and the
+    decision was not: the defect was a stale but *in-range* index, which no bounds assertion sees at
+    any level.
+- ⚠️ **PRESENT IS NOT ACTIVE — a witness can prove a mechanism was LOADED and say nothing about
+  whether it TOOK EFFECT.** When an instrument works by interposition, injection or overriding
+  (LD_PRELOAD, a monkey-patch, a subclass, a mock registered in a container, an interceptor
+  installed by a constructor), the natural proof is "did the thing get installed?" — and that proof
+  is satisfied in configurations where installation succeeds and OVERRIDING DOES NOT.
+  - **Trigger:** your evidence of instrumentation is existence — a file the injector wrote, a
+    symbol present in the binary, a constructor that ran, a plugin that imported.
+  - **Procedure:** require evidence written by the OVERRIDE ITSELF on the path under test, not by
+    the mechanism's arrival. Ask what outranks you: a strong symbol beats a weak one, a sanitizer's
+    allocator beats an LD_PRELOAD interposer, an earlier entry in a preload list beats a later one,
+    an alternative allocator linked into the binary beats both.
+  - ⚠️ **The scan that guards this is usually scoped too narrowly.** A repo checking that no *test*
+    redefines the overridden symbol does not see a definition in *production* sources, which is the
+    same link closure. Derive the scope from what the LINKER sees, not from where such code is
+    expected to live.
+  - **Where it lands when true:** the gate reports clean because nothing was ever measured, which is
+    class 1 by a different door — and the positive control is the only arm that can tell, because
+    it is the only one whose expected result is a FAILURE.
+- ⚠️ **A REFUSAL IS ONLY AS WIDE AS THE ESCAPE IT CATCHES — and the escapes that matter exit
+  SUCCESSFULLY.** A guard written to turn an unusable input into a named error is itself an
+  instrument, so ask what reaches the interpreter *past* it. In Python the sharp edge is that
+  `except Exception` does not cover `SystemExit` or `KeyboardInterrupt` (both `BaseException`), so a
+  loaded module that calls `sys.exit(0)` does not raise past the guard — **it terminates the whole
+  process with status 0**, and every downstream step reads that as success with empty output.
+  - **Trigger:** you are guarding a plugin load, an `exec_module`, a config eval, a subprocess
+    wrapper — anywhere foreign code runs inside your process and you wrote `except Exception`.
+  - **Procedure:** enumerate the escape deliberately (`except (Exception, SystemExit)` catches the
+    threat without swallowing an operator's ^C), and **write the arm that exits zero** — a fixture
+    whose body is `sys.exit(0)`, asserted to produce the named refusal. A syntax-error fixture does
+    not cover this: it tests a different branch and is the arm people write.
+  - **And state the bound you did not close.** `os._exit()` is uncatchable by anything; when that is
+    the residue, the surviving defence belongs one level out (a caller asserting the output is
+    non-empty), named at both ends rather than assumed.
 - ⚠️ **A THRESHOLD THAT FLAKES IS USUALLY ALSO BLIND, AND THE FLAKE IS THE HALF YOU NOTICE.** A
   wall-clock band derived as a *ratio to some other timeout* rather than measured against the
   behaviour rejects by machine load — the visible symptom, which gets an issue filed. Ask the other
@@ -148,6 +205,16 @@ prints `0` for a whole syntax.
   migrating it — and add a control that fails if the fallback is reverted, since a control asserting
   the common case would have passed the whole time it was wrong.
 
+- ⚠️ **AN ORACLE'S ERROR ROUTED INTO THE "NOT APPLICABLE" BRANCH IS THE SAME FALLBACK, AND IN A GATE
+  IT FAILS OPEN.** The classifier's-fallback form above, applied to a trust decision. In fixpp#490's
+  first fix, `git rev-parse` failing was read as "not a git tree", and that branch keeps the old,
+  permissive behaviour. So the stale pin the patch exists to refuse resolved at rc 0 again. The
+  realistic trigger needed no caller action: git refuses a repository it considers of *dubious
+  ownership*. **Procedure:** enumerate the oracle's outcomes (answer / legitimately absent / could not
+  tell) and give *could not tell* its own branch, which refuses. Prove "absent" positively, e.g. that
+  no `.git` exists at or above the root. Then force the failure (`GIT_TEST_ASSUME_DIFFERENT_OWNER=1`,
+  a nonexistent `GIT_DIR`) and require the refusal. (PR #496, Gate B round 1.)
+
 - ⚠️ **A SHELL PIPELINE CAN TURN A SUCCESSFUL MATCH INTO A FAILURE, AND IT DOES SO ONLY ON LARGE
   INPUTS.** Under `set -o pipefail`, `printf '%s' "$out" | grep -q PATTERN` exits **141** when the
   pattern MATCHES: `grep -q` stops at the first hit and closes the pipe, `printf` takes SIGPIPE, and
@@ -176,6 +243,20 @@ prints `0` for a whole syntax.
   `THREADED`), read every one by hand: correcting an instrument in the *safe* direction is still a
   change in the *unsafe* direction for the rows it reclassifies. (#289 batch 21.)
 
+- ⚠️ **A phrase grep over comments cannot see a phrase that WRAPS.** In fixpp#495's Gate B, round 2's
+  check for a stale claim (`git grep -n -i 'heap pimpl' -- include src` must be empty) was already
+  empty on the UNFIXED tree. The phrase in `reify.cpp` was split `heap` / `// pimpl` across two
+  comment lines, so round 1's sweep, which used the same grep, had missed it too. **Procedure:** before
+  searching, join each line wrap with its comment leader (`//`, `#`, `*`, `>`) into a single space,
+  then match `word[\s-]+word`. Prove the search finds the known site on the unfixed tree first.
+
+**The same class, in a benchmark: a timing row that never runs the code it is cited for.**
+- A flat paired delta reads as "no cost". It is only evidence if the timed loop reaches the changed path.
+- The 090 case (PR #494, Gate B): the existing reify row passed a view with no MsgType, so `reify()` returned before the factory it was cited for.
+- **Procedure:**
+  - Prove the bench reaches the path: a mutant that slows or deletes the path must move the number, or trace one iteration.
+  - Size small moved work with an attribution bench that times it alone. A small cost inside a large, noisy call is below resolution, not absent.
+
 ### 2. A fix that replaces a wrong claim with a NEW claim reproduces the defect
 
 Rounds of review converge only when a claim is **deleted**, not refreshed. A corrected claim is still a
@@ -193,6 +274,9 @@ re-runs a document. What follows from *structure* cannot rot; what follows from 
 - **Trigger:** you are about to write a number, a list, or a measurement into a document.
 - **Procedure:** keep the condition and the recipe; delete the answer. If the number is load-bearing,
   say so and name the command that regenerates it.
+- **Provenance is a result too.** "Unedited", "kept green", "no test is rewritten by this change" are claims about a diff that is still growing, and any later commit in the same PR can falsify them.
+  - In PR #494's Gate B, a round's own comment fix made its "UNEDITED" note false.
+  - Write the condition a reader can re-check, such as "exercised by `<cell>`", never the history.
 
 ### 4. A copy propagates a claim that is false at the new site
 
@@ -398,6 +482,16 @@ mode was live on the shipped path, exhibited by 083's own witness.
   "done". When a site's justification depends on an invariant, name the INVARIANT in the clause, not
   the assessment that happened to hold that day.
 
+**Instance (fixpp#495, caught before the PR by the per-effect bench).** The design note assessed
+`MessageView`'s new owner pointer against the effect it was added for: Index-mode views reaching the
+reify and clone copy sites. It concluded that no size pin moves. But the member sat on the class
+TEMPLATE, so every `access_mode` paid for it, including `Iter`, whose views never reach a copy site.
+`BM_Parser_Iter_20tag` went +6.7…+8.5% in 5 of 5 A-B pairs (+8 B per view, plus one store per
+parse). The fix (`06eada45`) makes the member Index-only
+(`[[no_unique_address]] std::conditional_t<Mode == Index, T, empty>`) and guards its stores with
+`if constexpr`. **Procedure:** a member added to a class template is an effect on EVERY
+instantiation. Assess, and bench, each mode's row, not only the mode the change targets.
+
 **Sibling.** Where class 9 is a justification that lost its SUBJECT, this is a justification that
 kept its subject and lost its SCOPE. Both are recorded on the same site pair (`#384`, `#389`) because
 083 produced one of each, in the same function, from the same one-line delimiter change.
@@ -507,6 +601,130 @@ population an audit asserts over. This is *creating* one, invisibly. Both say th
 moving object that the instrument's key does not track.
 
 ---
+
+### 14. A forbidden-list check catches only the spellings someone anticipated
+
+Asserting the **absence** of bad content is unbounded by construction: the next wording is not on the
+list. The failure is quiet and it compounds — each review round respells the claim, the list is
+widened to match, and the widening reads as progress. A reviewer acting adversarially will produce a
+phrase no list contained, and every live predicate reports PASS.
+
+- **Trigger:** you are enumerating forbidden words, phrases or patterns to police free text.
+- **Procedure:** invert it — assert the **complete permitted output**, normalising only the genuinely
+  nondeterministic fields (timings, ids, paths). A pin has nothing left to respell, and it turns a
+  reword from a silent pass into a loud, deliberate update. Pin **every** branch: the one no arm
+  checks is the one that regresses. Where a list must survive, treat it as the weaker half, say so,
+  and mutation-test that half specifically.
+- **Relation to class 2:** class 2 says a corrected claim is still a claim. This is its enforcement
+  twin — a check that enumerates wrong answers inherits the same treadmill as the claim it guards.
+
+### 15. A seam that outlives the window it observes leaks into whatever runs next
+
+Process-global instrumentation — an installed probe, a counter, a gauge — is sound only while its
+install window brackets **all** the work it counts. Uninstall mid-flight and a pair is stranded: an
+entry is counted while its exit fires against a null hook, leaving a phantom that every later
+consumer reads as real. The signature is an arm that **passes alone and fails in the suite**, or one
+that only fails under a shuffled order.
+
+- **Trigger:** you are installing or removing a process-global hook, or reasoning about when one is
+  safe to remove.
+- **Procedure:** bracket the seam by a **barrier**, not by hope. Two specific traps:
+  - the entry hook's pointer may be **captured by value at submit time**, so it stays callable after
+    the uninstall — uninstalling is not a barrier, and resetting a counter is not synchronisation;
+  - a **bounded drain is an observer, not a barrier**. It returns when its budget expires, with work
+    still outstanding. Only a join is a barrier.
+  Prefer a **structural** guarantee over a timing one: declare the guard so that reverse destruction
+  runs the joining object first. A structural ordering needs no mutation to license it, which matters
+  because the timing version may be unreproducible with the forcing seams available.
+- **Scanning heuristic:** grep for `install_`/`uninstall_` pairs not wrapped in a guard, and for a
+  guard declared *after* the pool or context whose work it observes.
+
+### 16. A disabled gate rots everything written to satisfy it, and the two gaps hide each other
+
+A suppression, exemption or annotation written for a gate that is **off** is never exercised as a
+claim. It decays with no symptom, because the only thing that would have contradicted it is the gate.
+The dead gate and the dead opt-out are therefore the *same* blind spot, each concealing the other.
+Turning the gate on does not merely surface the findings it was always meant to catch — it surfaces
+every opt-out that quietly stopped working while nobody was looking.
+
+**Reference instance: fixpp#439.** The gcc presets set `FIXPP_WERROR=OFF` from the first presets
+commit. Fifteen deprecated-API uses across nine files were suppressed with
+
+```c
+#if defined(__clang__) || defined(__GNUC__)
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+```
+
+The **guard names `__GNUC__`**, so it claims to cover GCC. The **pragma is `#pragma clang
+diagnostic`**, which GCC does not honour — and does not warn about, so there is no diagnostic about
+the missing diagnostic. The suppression was inert on GCC for its entire life, and nothing noticed
+because the one lane that could have noticed had `-Werror` off. The guard recorded an INTENT; the
+pragma is the MECHANISM; only the mechanism executes. (The same flip also found a second, larger
+rot in the same direction: `[[clang::lifetimebound]]`, which GCC reports under `-Wattributes` — a
+DEFAULT-ON warning, so `-Wall` was never what stood between the tree and the gate. 92767 distinct
+sites **as measured at #439**; the figure is a record of that measurement, not a property of the
+tree — it is dominated by generated headers and moves with every regeneration.)
+
+**Three instances, one flip, three different mechanisms — which is the point.** The same gate flip
+also found `-Wno-macro-redefined` applied to every non-MSVC compiler in `tests/log/CMakeLists.txt`,
+with a comment saying it was there *"so FIXPP_WERROR does not turn the expected redefinition into an
+error"*. That is a **clang** spelling. GCC does not recognise it and accepts it silently — an unknown
+`-Wno-*` is only ever reported when some other diagnostic fires — so the target could not build once
+`-Werror` arrived. GCC itself printed the diagnosis (*"unrecognized command-line option
+'-Wno-macro-redefined' may have been intended to silence earlier diagnostics"*), which nothing had
+ever been in a position to read. So the class is not "someone wrote the wrong pragma": the rot
+appeared in a **pragma**, in a **preprocessor guard**, and in a **build-system flag**, because the
+common cause is the disabled gate, not the mechanism.
+
+⚠️ **Prefer removing the CAUSE to suppressing the diagnostic, because a suppression is what rots.**
+The redefinition fix is `-U` then `-D` rather than a second `-D` plus a silencer: then no
+redefinition happens on any compiler and there is nothing to keep working. Where you do suppress,
+verify the SUPPRESSED PROPERTY still holds — here, that the macro is still `3` afterwards and not
+merely undefined, which a check for "the error went away" would have missed.
+
+- **Trigger:** you are about to ENABLE a gate that has been off — a lane's `-Werror`, a sanitizer, a
+  lint, a coverage floor — or you are writing an opt-out for a gate that is off on some platform.
+- **Procedure:** budget for the rot rather than meeting it as a surprise. MEASURE before flipping:
+  replay the lane's own compile/run commands with the gate on and enumerate what fails, instead of
+  flipping and reading the CI log. Compile to `/dev/null`, not `-fsyntax-only` — a front-end-only run
+  cannot see the optimiser-emitted diagnostics, which are exactly the compiler-specific ones a
+  disabled lane accumulates. Then check each surviving opt-out **two-sided**: prove the suppressed
+  site is silent AND that an unsuppressed sibling still fires, on *every* compiler the guard names.
+- ⚠️ **Enabling the gate also invalidates the lane's compiler cache**, because the gate is a flag and
+  a flag moves every command line. Check what asserts a cache HIT FLOOR before flipping: a floor will
+  fire correctly on the deliberate re-seed and read as a failure of the change.
+- **Sibling:** class 3 says a document may not record a RESULT. This is its executable form — a
+  PREPROCESSOR CONDITION can record an intent it does not implement, and unlike a comment it looks
+  like code that someone checked.
+
+---
+
+### 17. Trust keyed on a textual proxy admits whatever shares the proxy
+
+A check decides "this is the thing I trust" by comparing a **derived or textual stand-in** — a
+basename for a path, a path string for the directory it names, a name for an identity. Anything that
+shares the stand-in without being the thing passes the check.
+
+- **Trigger:** a trust, ownership or identity decision compares a value you *computed from* the
+  thing (a suffix, a basename, a normalised string, a name), or treats "the text matches" as "it
+  exists".
+- **Procedure:** compare the full, normalised value, and state what the normalisation does and does
+  not canonicalise. Where the decision needs the thing to be real, test that it is real (`-d`, a
+  lookup), not that its name is right. Then write the alias explicitly as a test case — a different
+  thing that shares the proxy — and require it to be refused.
+- **Instance (PR #496, fixpp#490, Gate B rounds 2 and 3).** The pin was trusted when its basename
+  equalled the branch, so `elsewhere/091-own` was trusted on `091-own`, and a legacy `specs/feature/x`
+  on branch `x`. That was fixed to full-path identity, and the next round found the second layer:
+  a foreign pin *naming* `specs/<branch>` was trusted though that directory did not exist, so a
+  bundle-less branch resolved and `setup-plan.sh` would have created it. Each layer passed every arm
+  written for the previous one; only a case built as an alias exposed it.
+- ⚠️ **A name is still a proxy after the fix.** A recorded branch name identifies a branch by NAME, so a
+  branch re-created under that name inherits the trust. That residue is disclosed, not closed —
+  close it only if the name can be reused without deliberate intent.
+
+**Sibling.** Class 13 is an instrument keyed on an identifier that misses a *copy*. This is a gate
+keyed on an identifier that admits an *alias*. Same key, opposite direction.
 
 ## How to query the instances
 
