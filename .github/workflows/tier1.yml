@@ -571,8 +571,8 @@ jobs:
         env:
           CCACHE_VERSION: "4.14"
           CCACHE_SHA256: c64760b0b85ba86068f4cd162dc42e2dc39c6f46b0cb8c1990dfccbec7a1fed0
-          CCACHE_STORAGE_HTTP_VERSION: "0.9"
-          CCACHE_STORAGE_HTTP_SHA256: 875dbf6d575d06e4c4492f1ba639beb68530bc23382031a6bacc767cded9f463
+          CCACHE_STORAGE_HTTP_VERSION: "0.10"
+          CCACHE_STORAGE_HTTP_SHA256: 88963ef2cc21ca588145d46bcb02b8295275975ed75696eedf2cdb0e9543edd0
         run: |
           ccache_archive="ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.gz"
           curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
@@ -1618,8 +1618,8 @@ jobs:
         env:
           CCACHE_VERSION: "4.14"
           CCACHE_SHA256: c64760b0b85ba86068f4cd162dc42e2dc39c6f46b0cb8c1990dfccbec7a1fed0
-          CCACHE_STORAGE_HTTP_VERSION: "0.9"
-          CCACHE_STORAGE_HTTP_SHA256: 875dbf6d575d06e4c4492f1ba639beb68530bc23382031a6bacc767cded9f463
+          CCACHE_STORAGE_HTTP_VERSION: "0.10"
+          CCACHE_STORAGE_HTTP_SHA256: 88963ef2cc21ca588145d46bcb02b8295275975ed75696eedf2cdb0e9543edd0
         run: |
           ccache_archive="ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.gz"
           curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
@@ -3232,8 +3232,8 @@ jobs:
         env:
           CCACHE_VERSION: "4.14"
           CCACHE_SHA256: c64760b0b85ba86068f4cd162dc42e2dc39c6f46b0cb8c1990dfccbec7a1fed0
-          CCACHE_STORAGE_HTTP_VERSION: "0.9"
-          CCACHE_STORAGE_HTTP_SHA256: 875dbf6d575d06e4c4492f1ba639beb68530bc23382031a6bacc767cded9f463
+          CCACHE_STORAGE_HTTP_VERSION: "0.10"
+          CCACHE_STORAGE_HTTP_SHA256: 88963ef2cc21ca588145d46bcb02b8295275975ed75696eedf2cdb0e9543edd0
         run: |
           ccache_archive="ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.gz"
           curl --fail --location --show-error --silent --retry 5 --retry-all-errors --retry-delay 5 \
